@@ -1,0 +1,69 @@
+{
+  "name": "@songfreedom/sse-client",
+  "version": "0.1.1",
+  "private": false,
+  "packageManager": "pnpm@9.15.4",
+  "type": "module",
+  "description": "Dependency-free Server-Sent Events client: fetch transport, typed event routing, reconnect with Last-Event-ID resume, idle watchdog and shared connections",
+  "keywords": [
+    "sse",
+    "server-sent-events",
+    "eventsource",
+    "fetch",
+    "stream",
+    "reconnect",
+    "vue",
+    "typescript"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/songfreedom/sse-client.git"
+  },
+  "homepage": "https://github.com/songfreedom/sse-client#readme",
+  "bugs": {
+    "url": "https://github.com/songfreedom/sse-client/issues"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./vue": "./src/vue.ts"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node scripts/build-package.mjs",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "publish:npm": "pnpm build && pnpm publish --no-git-checks --registry https://registry.npmjs.org/"
+  },
+  "publishConfig": {
+    "directory": "dist",
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "vue": "^3.3.0"
+  },
+  "peerDependenciesMeta": {
+    "vue": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "eslint": "^9.17.0",
+    "eslint-config-prettier": "^10.1.0",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.0",
+    "vitest": "^2.1.8",
+    "vue": "^3.5.13"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
