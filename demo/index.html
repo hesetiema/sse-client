@@ -34,10 +34,34 @@
         display: grid;
         gap: 16px;
       }
+      .head-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
       h1 {
         margin: 0;
         font-size: 20px;
         letter-spacing: 0.2px;
+      }
+      .lang {
+        display: inline-flex;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        overflow: hidden;
+      }
+      .lang button {
+        border: 0;
+        border-radius: 0;
+        padding: 5px 14px;
+        font-size: 12px;
+        background: transparent;
+        color: var(--muted);
+      }
+      .lang button.active {
+        background: #1f4d80;
+        color: var(--text);
       }
       .sub {
         margin: 4px 0 12px;
@@ -153,6 +177,34 @@
         padding: 0;
         overflow: hidden;
       }
+      .mem-card {
+        padding: 0;
+        overflow: hidden;
+      }
+      .mem-body {
+        padding: 12px 14px 14px;
+      }
+      #chart {
+        display: block;
+        width: 100%;
+        height: 96px;
+        margin-top: 10px;
+        border: 1px solid #182029;
+        border-radius: 8px;
+        background: #0b1219;
+      }
+      .mem-legend {
+        margin-top: 6px;
+        font-size: 11.5px;
+        color: var(--muted);
+        font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+      }
+      .pill b.warn {
+        color: var(--warn);
+      }
+      .pill b.bad {
+        color: var(--bad);
+      }
       .log-head {
         display: flex;
         justify-content: space-between;
@@ -220,61 +272,153 @@
   <body>
     <main>
       <header>
-        <h1>SSE console</h1>
-        <p class="sub">@songfreedom/sse-client · real browser + real Nginx + real streaming</p>
+        <div class="head-row">
+          <h1 data-i18n="app.title">SSE console</h1>
+          <div class="lang" role="group" aria-label="Language switch">
+            <button id="lang-en" type="button">EN</button>
+            <button id="lang-zh" type="button">中文</button>
+          </div>
+        </div>
+        <p class="sub" data-i18n="app.subtitle">
+          @songfreedom/sse-client · real browser + real Nginx + real streaming
+        </p>
         <div class="pills">
           <span class="pill" id="status" data-status="idle">idle</span>
-          <span class="pill">attempts <b id="attempts">0</b></span>
+          <span class="pill"><span data-i18n="pill.attempts">attempts</span> <b id="attempts">0</b></span>
           <span class="pill">lastEventId <b id="lastId">-</b></span>
-          <span class="pill">events <b id="count">0</b></span>
+          <span class="pill"><span data-i18n="pill.events">events</span> <b id="count">0</b></span>
         </div>
       </header>
 
       <section class="card">
         <div class="grid">
           <label>
-            Endpoint
+            <span data-i18n="field.endpoint">Endpoint</span>
             <select id="endpoint">
-              <option value="direct">Direct :8787 (no gateway)</option>
-              <option value="nginx">Nginx :8081 (correct)</option>
-              <option value="broken">Nginx :8082 (misconfigured)</option>
+              <option value="direct" data-i18n="endpoint.direct">Direct :8787 (no gateway)</option>
+              <option value="nginx" data-i18n="endpoint.nginx">Nginx :8081 (correct)</option>
+              <option value="broken" data-i18n="endpoint.broken">Nginx :8082 (misconfigured)</option>
             </select>
           </label>
-          <label> Scenario <select id="scenario"></select> </label>
-          <label> Interval (ms) <input id="interval" type="number" value="1000" min="20" step="100" /> </label>
-          <label> idleTimeout (ms) <input id="idle" type="number" value="0" min="0" step="500" /> </label>
-          <label> rotateInterval (ms) <input id="rotate" type="number" value="0" min="0" step="1000" /> </label>
-          <label> maxRetry <input id="maxRetry" type="number" value="3" min="0" /> </label>
-          <label> token TTL (ms) <input id="ttl" type="number" value="60000" min="1000" step="1000" /> </label>
-          <label class="check"><input type="checkbox" id="pauseHidden" /> pauseWhenHidden (suspend in background)</label>
-          <label class="check"><input type="checkbox" id="refreshToken" /> Refresh token on 401, then retry</label>
-          <label class="check"><input type="checkbox" id="reconnectOnEnd" checked /> Reconnect when the server ends the stream</label>
+          <label>
+            <span data-i18n="field.scenario">Scenario</span>
+            <select id="scenario"></select>
+          </label>
+          <label>
+            <span data-i18n="field.interval" title="interval">Interval (ms)</span>
+            <input id="interval" type="number" value="1000" min="20" step="100" />
+          </label>
+          <label>
+            <span data-i18n="field.burst" title="burst">burst (flood / burst)</span>
+            <input id="burst" type="number" value="10" min="1" step="10" />
+          </label>
+          <label>
+            <span data-i18n="field.size" title="size">payload bytes (flood / burst)</span>
+            <input id="size" type="number" value="1024" min="64" step="256" />
+          </label>
+          <label>
+            <span data-i18n="field.idle" title="idleTimeout">idleTimeout (ms)</span>
+            <input id="idle" type="number" value="0" min="0" step="500" />
+          </label>
+          <label>
+            <span data-i18n="field.rotate" title="rotateInterval">rotateInterval (ms)</span>
+            <input id="rotate" type="number" value="0" min="0" step="1000" />
+          </label>
+          <label>
+            <span data-i18n="field.maxRetry" title="maxRetry">maxRetry</span>
+            <input id="maxRetry" type="number" value="3" min="0" />
+          </label>
+          <label>
+            <span data-i18n="field.ttl">token TTL (ms)</span>
+            <input id="ttl" type="number" value="60000" min="1000" step="1000" />
+          </label>
+          <label class="check">
+            <input type="checkbox" id="pauseHidden" />
+            <span data-i18n="opt.pauseHidden" title="pauseWhenHidden">pauseWhenHidden (suspend in background)</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="refreshToken" />
+            <span data-i18n="opt.refreshToken">Refresh token on 401, then retry</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="reconnectOnEnd" checked />
+            <span data-i18n="opt.reconnectOnEnd">Reconnect when the server ends the stream</span>
+          </label>
         </div>
 
         <div class="actions">
-          <button id="connect" class="primary">Connect</button>
-          <button id="restart">Restart (keep lastEventId)</button>
-          <button id="close">Close</button>
-          <button id="revoke" class="danger">Revoke token</button>
-          <button id="clear">Clear log</button>
+          <button id="connect" class="primary" type="button" data-i18n="btn.connect">Connect</button>
+          <button id="restart" type="button" data-i18n="btn.restart">Restart (keep lastEventId)</button>
+          <button id="close" type="button" data-i18n="btn.close">Close</button>
+          <button id="revoke" class="danger" type="button" data-i18n="btn.revoke">Revoke token</button>
+          <button id="clear" type="button" data-i18n="btn.clear">Clear log</button>
         </div>
 
-        <p class="hint" id="hint">Pick a scenario to see what to watch for.</p>
+        <p class="hint" id="hint" data-i18n="hint.default">Pick a scenario to see what to watch for.</p>
+      </section>
+
+      <section class="card mem-card">
+        <div class="log-head">
+          <span data-i18n="mem.title">Memory sampler</span>
+          <span id="memSource">performance.memory</span>
+        </div>
+        <div class="mem-body">
+          <div class="pills">
+            <span class="pill">heap <b id="heap">-</b></span>
+            <span class="pill">peak <b id="peak">-</b></span>
+            <span class="pill" title="delta since Connect, before GC — a saw-tooth is normal">
+              <span data-i18n="mem.delta">Δ heap</span> <b id="heapDelta">-</b>
+            </span>
+            <span class="pill">recv <b id="recv">0 MB</b></span>
+            <span class="pill"><span data-i18n="mem.rate">rate</span> <b id="rate">0 /s</b></span>
+            <span class="pill">dom <b id="dom">-</b></span>
+          </div>
+          <canvas id="chart" width="1000" height="96"></canvas>
+          <div class="mem-legend" id="memLegend">heap — · dom —</div>
+        </div>
       </section>
 
       <section class="card log-card">
-        <div class="log-head"><span>Event log</span><span id="endpointLabel">-</span></div>
+        <div class="log-head"><span data-i18n="log.title">Event log</span><span id="endpointLabel">-</span></div>
         <div id="log" class="log"></div>
       </section>
     </main>
 
     <script type="module">
-      // Dynamic import so a missing dist/ shows a readable hint instead of a blank page.
-      import("./main.js").catch((error) => {
-        const hint = document.getElementById("hint");
-        hint.textContent = `Failed to load: run "pnpm build" to generate dist/, then refresh. Reason: ${error.message}`;
+      // Keep the failure modes visible instead of a page that renders but does nothing.
+      const hint = document.getElementById("hint");
+      let zh = false;
+      try {
+        const stored = localStorage.getItem("sse-demo-lang");
+        zh = stored ? stored === "zh" : (navigator.language || "").toLowerCase().startsWith("zh");
+      } catch {
+        zh = false;
+      }
+      const fail = (message) => {
+        hint.textContent = message;
         hint.style.color = "#f85149";
+        hint.style.borderLeftColor = "#f85149";
+      };
+
+      // The ?t= suffix bypasses the ES module cache: this page is edited while it is
+      // open, and a stale main.js used to look like "buttons do nothing".
+      import(`./main.js?t=${Date.now()}`).catch((error) => {
+        fail(
+          zh
+            ? `加载失败：先执行 pnpm build 生成 dist/，再刷新页面。原因：${error.message}`
+            : `Failed to load: run "pnpm build" to generate dist/, then refresh. Reason: ${error.message}`,
+        );
       });
+
+      // main.js sets __sseDemoReady once it wired everything up.
+      setTimeout(() => {
+        if (window.__sseDemoReady) return;
+        fail(
+          zh
+            ? "界面脚本没有启动（可能是旧缓存，或 dist/ 未构建）。请按 Ctrl+F5 强制刷新。"
+            : "The UI script did not start (stale cache, or dist/ is missing). Press Ctrl+F5 to hard refresh.",
+        );
+      }, 2000);
     </script>
   </body>
 </html>

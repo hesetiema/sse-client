@@ -1,5 +1,7 @@
 # @songfreedom/sse-client
 
+English · [简体中文](./README.zh-CN.md)
+
 [![npm version](https://img.shields.io/npm/v/%40songfreedom%2Fsse-client)](https://www.npmjs.com/package/@songfreedom/sse-client)
 [![license](https://img.shields.io/npm/l/%40songfreedom%2Fsse-client)](./LICENSE)
 [![minzip size](https://img.shields.io/bundlephobia/minzip/%40songfreedom%2Fsse-client)](https://bundlephobia.com/package/@songfreedom/sse-client)
@@ -249,6 +251,28 @@ const batcher = createBatcher<string, Point>({
 client.on("IOT", (payload) => payload.data.forEach((p) => batcher.push(p)));
 ```
 
+### High frequency and large payloads: does memory grow?
+
+Not without bound, as long as the three caps are in place:
+
+1. **Network.** The read loop is pull-based (`await reader.read()`): a slow handler stops the
+   next read, the browser stops draining the socket, and the exhausted TCP window blocks the
+   server's `write()`. Backpressure propagates upstream without any extra flow-control protocol.
+2. **Parser.** The line `buffer` and the accumulated `data` lines of one event are both capped by
+   `maxBufferSize` (1MB by default); exceeding it raises a `protocol` error and disconnects. That
+   is a hard stop, not a "drop the oldest" policy — the `huge` and `no-blank-line` demo scenarios
+   exercise exactly this path.
+3. **Application.** The client keeps no history: a message is collectable as soon as it is
+   dispatched. Growth only comes from what your code retains — arrays, reactive stores, log tables.
+
+Measured (the demo's `flood` scenario via `pnpm demo:memory`, one Chrome tab): **368 MB** and
+48,000 events in 30 seconds, 4.6 MB peak heap, 0.8 MB after a forced GC (0.6 MB baseline), DOM
+nodes 117 → 117. The saw-tooth is unreclaimed garbage, not a leak. Details and the reproduction
+script are in [`demo/README.md`](./demo/README.md#6-high-frequency--memory-measurement).
+
+Two things remain yours to handle: do not accumulate messages in the handler, and lower
+`maxBufferSize` if every message is large and you want anomalies to surface sooner.
+
 ### Rotation vs reconnect
 
 A connection can stay alive while the server-side subscription is already gone. Rotation
@@ -308,7 +332,8 @@ pnpm build        # dist/ + dist/package.json
 ```
 
 Integration demo (real browser + real Nginx, plus a headless smoke run):
-see [demo/README.md](./demo/README.md) — `pnpm demo:server` / `pnpm demo:smoke`.
+see [demo/README.md](./demo/README.md) — `pnpm demo:server` / `pnpm demo:smoke` /
+`pnpm demo:matrix` / `pnpm demo:memory`.
 
 Releasing: bump the version, then
 

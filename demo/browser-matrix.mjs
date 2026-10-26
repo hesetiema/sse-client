@@ -143,6 +143,10 @@ async function openPage(port) {
   await cdp.send("Page.navigate", { url: PAGE_URL });
   await loaded;
 
+  // Pin the UI to English: the console follows navigator.language by default and
+  // the assertions below match English copy.
+  await evaluate(cdp, 'window.__setLang?.("en")');
+
   return { cdp, errors, targetId };
 }
 

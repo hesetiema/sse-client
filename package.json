@@ -36,6 +36,7 @@
     "demo:server": "node demo/server.mjs",
     "demo:smoke": "node demo/smoke.mjs",
     "demo:matrix": "node demo/browser-matrix.mjs",
+    "demo:memory": "node demo/memory-probe.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "publish:npm": "pnpm build && pnpm publish --no-git-checks --registry https://registry.npmjs.org/"
   },

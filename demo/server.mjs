@@ -43,6 +43,8 @@ const SCENARIOS = [
   { id: "html", label: "html — 200 + text/html (gateway login page)" },
   { id: "error500", label: "error500 — plain 500" },
   { id: "error401", label: "error401 — plain 401 (expired token)" },
+  { id: "flood", label: "flood — burst events per interval, fixed payload size (pressure test)" },
+  { id: "burst", label: "burst — burst events in ONE write, then idle (single-chunk parse)" },
 ];
 
 const tokens = new Map();
@@ -106,6 +108,18 @@ function payload(seq) {
   });
 }
 
+/** Large payload for the pressure scenarios; the filler is built once per connection. */
+function bigPayload(seq, filler) {
+  return JSON.stringify({
+    seq,
+    topic: "alarm",
+    level: "high",
+    device: `pump-${seq % 64}`,
+    at: Date.now(),
+    filler,
+  });
+}
+
 function readBody(req, limit = 64 * 1024) {
   return new Promise((done) => {
     let size = 0;
@@ -134,7 +148,11 @@ async function handleSubscribe(req, res, url) {
   const params = url.searchParams;
   const scenario = params.get("scenario") ?? scenarioFromBody(body) ?? "normal";
   const interval = clamp(Number(params.get("interval") ?? 1000), 20, 120_000);
-  const count = clamp(Number(params.get("count") ?? 0), 0, 10_000);
+  const count = clamp(Number(params.get("count") ?? 0), 0, 1_000_000);
+  // Pressure scenarios only: events per tick and payload size used to build the burst.
+  const burstDefault = scenario === "burst" ? 2000 : 10;
+  const burst = clamp(Number(params.get("burst") ?? burstDefault), 1, 20_000);
+  const size = clamp(Number(params.get("size") ?? 1024), 64, 256 * 1024);
   const retryMs = clamp(Number(params.get("retry") ?? 0), 0, 120_000);
   const delay = clamp(Number(params.get("delay") ?? 3000), 0, 120_000);
   const lastEventId = req.headers["last-event-id"];
@@ -183,6 +201,30 @@ async function handleSubscribe(req, res, url) {
   };
 
   const emit = (seq, event = "ALARM") => write(frame(seq, event, payload(seq)));
+
+  /**
+   * Backpressure-aware write: `res.write()` returning false means the socket
+   * buffer is full, so wait for "drain" instead of queueing chunks in memory.
+   * Without this a fast producer grows the server's own buffer without bound.
+   */
+  const writeDrained = (chunk) =>
+    new Promise((resolve) => {
+      if (stopped) {
+        resolve();
+        return;
+      }
+      if (res.write(chunk)) {
+        resolve();
+        return;
+      }
+      const done = () => {
+        res.off("drain", done);
+        res.off("close", done);
+        resolve();
+      };
+      res.once("drain", done);
+      res.once("close", done);
+    });
 
   try {
     switch (scenario) {
@@ -287,6 +329,40 @@ async function handleSubscribe(req, res, url) {
           write(line);
           await sleep(10);
         }
+        break;
+      }
+
+      case "flood": {
+        // Sustained pressure: `burst` frames every `interval`, each `size` bytes.
+        // Defaults are 10 frames per 20ms tick ≈ 500 events/s at ~1KB each.
+        const filler = "x".repeat(Math.max(0, size - 240));
+        let seq = 0;
+        for (;;) {
+          if (stopped) break;
+          let chunk = "";
+          for (let i = 0; i < burst; i += 1) {
+            if (count > 0 && seq >= count) break;
+            seq += 1;
+            chunk += frame(seq, "ALARM", bigPayload(seq, filler));
+          }
+          if (chunk) await writeDrained(chunk);
+          if (count > 0 && seq >= count) break;
+          await sleep(interval);
+        }
+        break;
+      }
+
+      case "burst": {
+        // A single write carrying `burst` frames (default 2000 ≈ 400KB): the
+        // client parses the whole chunk in one task, which is where main-thread
+        // long tasks come from. The connection then stays open but idle.
+        const filler = "x".repeat(Math.max(0, size - 240));
+        let chunk = "";
+        for (let seq = 1; seq <= burst; seq += 1) {
+          chunk += frame(seq, "ALARM", bigPayload(seq, filler));
+        }
+        await writeDrained(chunk);
+        while (!stopped) await sleep(1000);
         break;
       }
 
