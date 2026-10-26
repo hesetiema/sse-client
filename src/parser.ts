@@ -43,6 +43,7 @@ export function createSSEParser(options: SSEParserOptions = {}): SSEParser {
   let buffer = "";
   let isFirstChunk = true;
   let dataLines: string[] = [];
+  let dataSize = 0;
   let eventType = "";
   let lastId = "";
   let overflowed = false;
@@ -59,6 +60,7 @@ export function createSSEParser(options: SSEParserOptions = {}): SSEParser {
       data: dataLines.join("\n"),
     };
     dataLines = [];
+    dataSize = 0;
     eventType = "";
     options.onEvent?.(event);
   };
@@ -84,6 +86,13 @@ export function createSSEParser(options: SSEParserOptions = {}): SSEParser {
     switch (field) {
       case "data":
         dataLines.push(value);
+        dataSize += value.length + 1;
+        // The per-line buffer check in feed() cannot see this: a server that
+        // keeps sending data lines without ever terminating the event would
+        // grow the payload without bound.
+        if (dataSize > maxBufferSize) {
+          overflowed = true;
+        }
         break;
       case "event":
         eventType = value;
@@ -120,6 +129,11 @@ export function createSSEParser(options: SSEParserOptions = {}): SSEParser {
       }
 
       for (;;) {
+        if (overflowed) {
+          // Drop the rest of the chunk; the client tears the connection down.
+          buffer = "";
+          break;
+        }
         const match = LINE_BREAK.exec(buffer);
         if (!match) {
           break;
@@ -144,6 +158,7 @@ export function createSSEParser(options: SSEParserOptions = {}): SSEParser {
     reset() {
       buffer = "";
       dataLines = [];
+      dataSize = 0;
       eventType = "";
       lastId = "";
       overflowed = false;

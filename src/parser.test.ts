@@ -78,4 +78,13 @@ describe("createSSEParser frame parsing", () => {
     parser.feed(`data: ${"y".repeat(100)}\n\n`);
     expect(events).toHaveLength(0);
   });
+
+  it("caps the accumulated payload when data lines never terminate the event", () => {
+    // every line is short, so the per-line buffer check in feed() never fires
+    const parser = createSSEParser({ maxBufferSize: 64 });
+    for (let i = 0; i < 100; i += 1) {
+      parser.feed(`data: ${"x".repeat(20)}\n`);
+    }
+    expect(parser.overflowed).toBe(true);
+  });
 });

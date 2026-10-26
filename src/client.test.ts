@@ -281,7 +281,7 @@ describe("SSEClient transport", () => {
     });
     await vi.advanceTimersByTimeAsync(120);
 
-    // rotation at 100ms triggers an immediate second request（with a 5s backoff there would still be one call）
+    // rotation at 100ms triggers an immediate second request (with a 5s backoff there would still be one call)
     expect(callCount).toBe(2);
     client.close();
     await client.done;
@@ -556,6 +556,35 @@ describe("SSEClient protocol robustness", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(client.closed).toBe(true);
   });
+
+  it("decodes multi-byte characters split across chunks", async () => {
+    const bytes = encoder.encode("data: Ü✓😀\n\n");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        // "data: " is 6 bytes; Ü takes 6..7 (2 bytes), ✓ 8..10 (3), 😀 11..14 (4)
+        controller.enqueue(bytes.slice(0, 7)); // inside Ü
+        controller.enqueue(bytes.slice(7, 10)); // finishes Ü, inside ✓
+        controller.enqueue(bytes.slice(10, 12)); // finishes ✓, inside 😀
+        controller.enqueue(bytes.slice(12));
+        controller.close();
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(stream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        }),
+      ),
+    );
+    const received: unknown[] = [];
+    const client = new SSEClient({ url: "/s", reconnectOnEnd: false });
+    client.onMessage((message) => received.push(message.data));
+    await client.done;
+
+    expect(received).toEqual(["Ü✓😀"]);
+  });
 });
 
 describe("SSEClient offline handling", () => {
@@ -619,6 +648,104 @@ describe("SSEClient offline handling", () => {
     // dispatching offline after unbind must not change state (listeners removed)
     fakeWindow.dispatch("offline");
     expect(client.status).toBe("closed");
+  });
+});
+
+describe("SSEClient suspend and resume", () => {
+  /** Fake window + document sharing one listener registry. */
+  function stubPage(hidden: boolean) {
+    const listeners = new Map<string, Set<() => void>>();
+    const page = {
+      hidden,
+      addEventListener(type: string, handler: () => void) {
+        if (!listeners.has(type)) listeners.set(type, new Set());
+        listeners.get(type)!.add(handler);
+      },
+      removeEventListener(type: string, handler: () => void) {
+        listeners.get(type)?.delete(handler);
+      },
+      dispatch(type: string) {
+        listeners.get(type)?.forEach((handler) => handler());
+      },
+      show() {
+        page.hidden = false;
+        page.dispatch("visibilitychange");
+      },
+      hide() {
+        page.hidden = true;
+        page.dispatch("visibilitychange");
+      },
+    };
+    vi.stubGlobal("window", page);
+    vi.stubGlobal("document", page);
+    return page;
+  }
+
+  it("a client created while the page is hidden connects once it becomes visible", async () => {
+    const page = stubPage(true);
+    const fetchMock = vi.fn((_url: string, init: RequestInit) =>
+      Promise.resolve(hangingResponse(init, ["data: a\n\n"])),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new SSEClient({ url: "/s", pauseWhenHidden: true });
+    expect(client.status).toBe("idle");
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    page.show();
+    await vi.waitFor(() => expect(client.status).toBe("open"));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(client.closed).toBe(false);
+
+    client.close();
+    await client.done;
+  });
+
+  it("pauseWhenHidden suspends a live connection and reconnects when visible again", async () => {
+    const page = stubPage(false);
+    const fetchMock = vi.fn((_url: string, init: RequestInit) =>
+      Promise.resolve(hangingResponse(init, ["data: a\n\n"])),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new SSEClient({ url: "/s", pauseWhenHidden: true });
+    await vi.waitFor(() => expect(client.status).toBe("open"));
+
+    page.hide();
+    expect(client.status).toBe("idle");
+    // no new request is issued while hidden
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    page.show();
+    await vi.waitFor(() => expect(client.status).toBe("open"));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    client.close();
+    await client.done;
+  });
+
+  it("offline and online in the same tick reconnect instead of closing the client", async () => {
+    const page = stubPage(false);
+    const fetchMock = vi.fn((_url: string, init: RequestInit) =>
+      Promise.resolve(hangingResponse(init)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const onClose = vi.fn();
+
+    const client = new SSEClient({ url: "/s", onClose });
+    await vi.waitFor(() => expect(client.status).toBe("open"));
+
+    // a network blip shorter than one macrotask
+    page.dispatch("offline");
+    page.dispatch("online");
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(client.closed).toBe(false);
+    expect(onClose).not.toHaveBeenCalled();
+
+    client.close();
+    await client.done;
   });
 });
 

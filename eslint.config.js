@@ -18,6 +18,38 @@ export default tseslint.config(
       },
     },
   },
+  {
+    // Demo server runs in Node (no deps, but needs the usual globals).
+    files: ["demo/**/*.mjs"],
+    languageOptions: {
+      globals: {
+        console: "readonly",
+        process: "readonly",
+        Buffer: "readonly",
+        URL: "readonly",
+        WebSocket: "readonly",
+        fetch: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+      },
+    },
+  },
+  {
+    // Browser side of the demo.
+    files: ["demo/**/*.js"],
+    languageOptions: {
+      globals: {
+        console: "readonly",
+        document: "readonly",
+        fetch: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        URLSearchParams: "readonly",
+      },
+    },
+  },
   // Must stay last.
   eslintConfigPrettier,
 );

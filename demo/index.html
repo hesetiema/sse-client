@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>SSE console · @songfreedom/sse-client</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0d1117;
+        --card: #151b23;
+        --line: #232c38;
+        --text: #e6edf3;
+        --muted: #8b949e;
+        --accent: #4c9aff;
+        --ok: #3fb950;
+        --warn: #d29922;
+        --bad: #f85149;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 28px 20px 60px;
+        background: radial-gradient(1200px 600px at 20% -10%, #17243a 0%, var(--bg) 60%);
+        color: var(--text);
+        font: 14px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      main {
+        max-width: 1080px;
+        margin: 0 auto;
+        display: grid;
+        gap: 16px;
+      }
+      h1 {
+        margin: 0;
+        font-size: 20px;
+        letter-spacing: 0.2px;
+      }
+      .sub {
+        margin: 4px 0 12px;
+        color: var(--muted);
+        font-size: 12.5px;
+      }
+      .pills {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .pill {
+        border: 1px solid var(--line);
+        background: #101822;
+        border-radius: 999px;
+        padding: 4px 12px;
+        font-size: 12px;
+        color: var(--muted);
+        font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+      }
+      .pill b {
+        color: var(--text);
+        font-weight: 600;
+      }
+      #status[data-status="open"] {
+        border-color: #1f6f43;
+        color: var(--ok);
+      }
+      #status[data-status="connecting"],
+      #status[data-status="reconnecting"] {
+        border-color: #6b5a1c;
+        color: var(--warn);
+      }
+      #status[data-status="closed"] {
+        border-color: #7d2b28;
+        color: var(--bad);
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 16px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+        gap: 10px 14px;
+      }
+      label {
+        display: grid;
+        gap: 4px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      label.check {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--text);
+        font-size: 12.5px;
+        padding-top: 16px;
+      }
+      select,
+      input[type="number"] {
+        background: #0d141d;
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 7px 9px;
+        font: inherit;
+        font-size: 13px;
+        min-width: 0;
+      }
+      select:focus,
+      input:focus {
+        outline: 2px solid #2b4f7d;
+        outline-offset: 1px;
+      }
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 14px;
+      }
+      button {
+        background: #1c2531;
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 7px 14px;
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      button:hover {
+        border-color: #35455a;
+      }
+      button.primary {
+        background: #1f4d80;
+        border-color: #2b64a3;
+      }
+      button.danger {
+        color: #ffb4ae;
+      }
+      .hint {
+        margin: 12px 0 0;
+        font-size: 12.5px;
+        color: var(--muted);
+        border-left: 2px solid #2b3a4d;
+        padding-left: 10px;
+      }
+      .log-card {
+        padding: 0;
+        overflow: hidden;
+      }
+      .log-head {
+        display: flex;
+        justify-content: space-between;
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--line);
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .log {
+        height: 380px;
+        overflow: auto;
+        font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+        font-size: 12px;
+        padding: 8px 0;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 92px 78px 150px 1fr;
+        gap: 10px;
+        padding: 3px 14px;
+        border-bottom: 1px solid #11171f;
+        white-space: nowrap;
+      }
+      .row:hover {
+        background: #101822;
+      }
+      .t {
+        color: #5b6675;
+      }
+      .k {
+        color: var(--muted);
+      }
+      .k.msg {
+        color: var(--accent);
+      }
+      .k.error {
+        color: var(--bad);
+      }
+      .k.open {
+        color: var(--ok);
+      }
+      .k.close {
+        color: var(--warn);
+      }
+      .title {
+        color: #c9d4e0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .detail {
+        color: var(--muted);
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      @media (max-width: 720px) {
+        .row {
+          grid-template-columns: 80px 68px 1fr;
+        }
+        .row .detail {
+          display: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>SSE console</h1>
+        <p class="sub">@songfreedom/sse-client · real browser + real Nginx + real streaming</p>
+        <div class="pills">
+          <span class="pill" id="status" data-status="idle">idle</span>
+          <span class="pill">attempts <b id="attempts">0</b></span>
+          <span class="pill">lastEventId <b id="lastId">-</b></span>
+          <span class="pill">events <b id="count">0</b></span>
+        </div>
+      </header>
+
+      <section class="card">
+        <div class="grid">
+          <label>
+            Endpoint
+            <select id="endpoint">
+              <option value="direct">Direct :8787 (no gateway)</option>
+              <option value="nginx">Nginx :8081 (correct)</option>
+              <option value="broken">Nginx :8082 (misconfigured)</option>
+            </select>
+          </label>
+          <label> Scenario <select id="scenario"></select> </label>
+          <label> Interval (ms) <input id="interval" type="number" value="1000" min="20" step="100" /> </label>
+          <label> idleTimeout (ms) <input id="idle" type="number" value="0" min="0" step="500" /> </label>
+          <label> rotateInterval (ms) <input id="rotate" type="number" value="0" min="0" step="1000" /> </label>
+          <label> maxRetry <input id="maxRetry" type="number" value="3" min="0" /> </label>
+          <label> token TTL (ms) <input id="ttl" type="number" value="60000" min="1000" step="1000" /> </label>
+          <label class="check"><input type="checkbox" id="pauseHidden" /> pauseWhenHidden (suspend in background)</label>
+          <label class="check"><input type="checkbox" id="refreshToken" /> Refresh token on 401, then retry</label>
+          <label class="check"><input type="checkbox" id="reconnectOnEnd" checked /> Reconnect when the server ends the stream</label>
+        </div>
+
+        <div class="actions">
+          <button id="connect" class="primary">Connect</button>
+          <button id="restart">Restart (keep lastEventId)</button>
+          <button id="close">Close</button>
+          <button id="revoke" class="danger">Revoke token</button>
+          <button id="clear">Clear log</button>
+        </div>
+
+        <p class="hint" id="hint">Pick a scenario to see what to watch for.</p>
+      </section>
+
+      <section class="card log-card">
+        <div class="log-head"><span>Event log</span><span id="endpointLabel">-</span></div>
+        <div id="log" class="log"></div>
+      </section>
+    </main>
+
+    <script type="module">
+      // Dynamic import so a missing dist/ shows a readable hint instead of a blank page.
+      import("./main.js").catch((error) => {
+        const hint = document.getElementById("hint");
+        hint.textContent = `Failed to load: run "pnpm build" to generate dist/, then refresh. Reason: ${error.message}`;
+        hint.style.color = "#f85149";
+      });
+    </script>
+  </body>
+</html>

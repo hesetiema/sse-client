@@ -1,6 +1,6 @@
 {
   "name": "@songfreedom/sse-client",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": false,
   "packageManager": "pnpm@9.15.4",
   "type": "module",
@@ -33,6 +33,9 @@
     "build": "tsc -p tsconfig.build.json && node scripts/build-package.mjs",
     "lint": "eslint .",
     "test": "vitest run",
+    "demo:server": "node demo/server.mjs",
+    "demo:smoke": "node demo/smoke.mjs",
+    "demo:matrix": "node demo/browser-matrix.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "publish:npm": "pnpm build && pnpm publish --no-git-checks --registry https://registry.npmjs.org/"
   },

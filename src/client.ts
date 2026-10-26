@@ -134,6 +134,8 @@ export class SSEClient<E extends object = SSEEventMap> {
   private serverRetryDelay: number | undefined;
   private idleTimedOut = false;
   private rotating = false;
+  /** Set when `suspend()` aborts the attempt, so the abort is not read as an error. */
+  private suspendAbort = false;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private rotateTimer: ReturnType<typeof setTimeout> | null = null;
   private cancelController = new AbortController();
@@ -208,6 +210,10 @@ export class SSEClient<E extends object = SSEEventMap> {
     if (this.finished) {
       this.reset();
     }
+    // Bind the lifecycle listeners before the hidden-page check: a client
+    // constructed while the page is hidden (WebView preload, background tab)
+    // must still hear the visibilitychange event that resumes it later.
+    this.bindLifecycle();
     // Do not request anything while the page is hidden; wait for visibilitychange.
     // This is the usual case for WebView preloading.
     if (
@@ -220,7 +226,6 @@ export class SSEClient<E extends object = SSEEventMap> {
       return this;
     }
     this.running = true;
-    this.bindLifecycle();
     this.runPromise = this.connect()
       .catch((error: unknown) => {
         // Safety net: a throwing callback must not become an unhandled rejection.
@@ -335,6 +340,7 @@ export class SSEClient<E extends object = SSEEventMap> {
     this.idleTimedOut = false;
     this.rotating = false;
     this.suspended = null;
+    this.suspendAbort = false;
     this.serverRetryDelay = undefined;
     this.clearTimers();
     this.cancelController = new AbortController();
@@ -351,6 +357,9 @@ export class SSEClient<E extends object = SSEEventMap> {
       }
 
       const startedAt = Date.now();
+      // Cleared per attempt: a suspend that happened while the loop was sleeping
+      // must not be mistaken for a failure of this attempt.
+      this.suspendAbort = false;
       this.setState(this.attempt === 0 ? "connecting" : "reconnecting");
 
       this.attemptController = new AbortController();
@@ -368,7 +377,13 @@ export class SSEClient<E extends object = SSEEventMap> {
       if (this.finished) {
         return;
       }
-      if (this.suspended) {
+      // A suspend (offline, hidden page) aborts the running attempt. `resume()`
+      // may already have cleared `suspended` before this rejection is observed,
+      // so the abort flag is checked as well; otherwise an interrupted attempt
+      // looks like a terminal error and closes the client for good.
+      const suspendedAbort = this.suspendAbort;
+      this.suspendAbort = false;
+      if (this.suspended || suspendedAbort) {
         this.setState("idle");
         continue;
       }
@@ -751,6 +766,7 @@ export class SSEClient<E extends object = SSEEventMap> {
       return;
     }
     this.suspended = reason;
+    this.suspendAbort = true;
     this.clearTimers();
     this.attemptController?.abort();
     this.setState("idle");

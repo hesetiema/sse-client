@@ -307,6 +307,9 @@ pnpm lint         # eslint
 pnpm build        # dist/ + dist/package.json
 ```
 
+Integration demo (real browser + real Nginx, plus a headless smoke run):
+see [demo/README.md](./demo/README.md) — `pnpm demo:server` / `pnpm demo:smoke`.
+
 Releasing: bump the version, then
 
 ```bash

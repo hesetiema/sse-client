@@ -59,4 +59,21 @@ describe("createSSEMessageStream message stream", () => {
 
     await expect(collect(stream as ReadableStream<SSEMessage>)).rejects.toBeInstanceOf(SSEError);
   });
+
+  it("decodes a multi-byte character split across byte chunks", async () => {
+    const bytes = encoder.encode("data: Ü✓😀\n\n");
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        // "data: " is 6 bytes; Ü takes 6..7 (2 bytes), ✓ 8..10 (3), 😀 11..14 (4)
+        controller.enqueue(bytes.slice(0, 7)); // inside Ü
+        controller.enqueue(bytes.slice(7, 10)); // finishes Ü, inside ✓
+        controller.enqueue(bytes.slice(10, 12)); // finishes ✓, inside 😀
+        controller.enqueue(bytes.slice(12));
+        controller.close();
+      },
+    });
+
+    const messages = await collect(body.pipeThrough(createSSEMessageStream()));
+    expect(messages.map((message) => message.data)).toEqual(["Ü✓😀"]);
+  });
 });
