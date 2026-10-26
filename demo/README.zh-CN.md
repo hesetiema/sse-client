@@ -79,7 +79,7 @@ nginx -p demo -c nginx.conf -s stop
 | `end` | 开启重连则自动重连；否则 `closed`，reason 为 `end` | `reconnectOnEnd` |
 | `done` | 收到 `data: [DONE]` 立即关闭，且无 JSON 解析错误 | `endSignal` |
 | `retry-field` | 断流后约 2 秒重连（对比日志时间戳） | 服务端 `retry:` |
-| `huge` | 2MB 单条消息 → `protocol` 错误，`closed` | `maxBufferSize` |
+| `huge` | 2MB 单条消息 → `protocol` 错误，`closed`；勾选「超限消息丢弃」则只丢该条、连接保持 | `maxBufferSize` + `overflowPolicy` |
 | `no-blank-line` | 累计超 1MB → `protocol` 错误（旧版本会一路涨内存） | 事件级缓冲上限 |
 | `slow` | `connecting` 持续 3 秒（网关默认 60s 读超时会断） | 慢握手 |
 | `accel` | `X-Accel-Buffering: no` 绕过 8082 的缓冲 | 上游自救开关 |
@@ -214,6 +214,27 @@ pnpm demo:memory --lang=zh --shots=%TEMP%\shots         # 顺带截一张中文�
 - 真会涨到 G 级的三种情况都不在客户端库里：业务把每条消息塞进数组 / 响应式 store、开着 DevTools 的 Network
   面板看流（会缓存每一帧）、没开 `pauseWhenHidden` 而后台页面一直往状态里写。
 - 想验证更长时间不泄漏：`--seconds=600`，采样点上限 300 个，不会自己涨。
+
+### 6.1 长任务与让出主线程
+
+联调台新增两个旋钮：`yieldEvery`（每 N 条让出主线程）和「处理耗时（ms/条）」（用忙等模拟真实的每条渲染成本）。
+把后者设成 1ms、`flood` 用 25 条/50ms、单块 `burst` 灌 2000 条，A/B 结果：
+
+```bash
+pnpm demo:memory --seconds=12 --interval=50 --burst=25 --size=512 --handler=1 --yield=0
+pnpm demo:memory --seconds=12 --interval=50 --burst=25 --size=512 --handler=1 --yield=20
+```
+
+| `yieldEvery` | burst 单次最长阻塞 | burst 主线程总耗时 | 收到事件 |
+| --- | --- | --- | --- |
+| `0` | **1467 ms** | 2032 ms | 2000 |
+| `20` | **117 ms** | 2046 ms | 2000 |
+
+总工作量一模一样（切片不省时间），最长阻塞降到 1/12。残余的 ~117ms 不是切片粒度问题：调到
+`yieldEvery: 5` 也是 117ms——2 秒的总积压会持续压住渲染，切片只能保证没有单次超长任务。
+
+`overflowPolicy` 同样在界面上（勾选框「超限消息丢弃、不断开」）。勾上后跑 `huge`：连接保持 `open`，
+只丢那一条，日志出现 `overflow` 行和累计丢弃数；不勾则是原来的 `protocol` 错误 + `closed`。
 
 ## 注意
 

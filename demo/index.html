@@ -329,6 +329,14 @@
             <input id="maxRetry" type="number" value="3" min="0" />
           </label>
           <label>
+            <span data-i18n="field.yield" title="yieldEvery">yieldEvery (0 = off)</span>
+            <input id="yieldEvery" type="number" value="0" min="0" step="50" />
+          </label>
+          <label>
+            <span data-i18n="field.handler" title="simulated handler cost per message">handler cost (ms/msg)</span>
+            <input id="handlerMs" type="number" value="0" min="0" step="1" />
+          </label>
+          <label>
             <span data-i18n="field.ttl">token TTL (ms)</span>
             <input id="ttl" type="number" value="60000" min="1000" step="1000" />
           </label>
@@ -343,6 +351,10 @@
           <label class="check">
             <input type="checkbox" id="reconnectOnEnd" checked />
             <span data-i18n="opt.reconnectOnEnd">Reconnect when the server ends the stream</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="overflowDrop" />
+            <span data-i18n="opt.overflowDrop">Drop oversized messages instead of closing (overflowPolicy: drop)</span>
           </label>
         </div>
 

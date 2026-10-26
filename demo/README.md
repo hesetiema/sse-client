@@ -80,7 +80,7 @@ The console offers three endpoints:
 | `end` | Reconnect when enabled; otherwise `closed` with reason `end` | `reconnectOnEnd` |
 | `done` | `data: [DONE]` closes immediately with no JSON error | `endSignal` |
 | `retry-field` | Reconnect roughly 2s after the drop (compare timestamps) | Server `retry:` |
-| `huge` | 2MB message → `protocol` error, `closed` | `maxBufferSize` |
+| `huge` | 2MB message → `protocol` error, `closed`; with "Drop oversized messages" ticked only that message is lost | `maxBufferSize` + `overflowPolicy` |
 | `no-blank-line` | Past 1MB → `protocol` error (older builds grew the buffer) | Per-event buffer cap |
 | `slow` | `connecting` lasts 3s (a gateway's 60s read timeout would cut it) | Slow handshake |
 | `accel` | `X-Accel-Buffering: no` bypasses the 8082 buffering | Upstream escape hatch |
@@ -226,6 +226,30 @@ Worth knowing:
   `pauseWhenHidden` left off while a background page keeps writing into state.
 - For a longer soak use `--seconds=600`; the sample ring is capped at 300 entries, so the probe
   itself does not grow.
+
+### 6.1 Long tasks and yielding
+
+The console gained two knobs: `yieldEvery` (yield to the main thread every N events) and "handler cost
+(ms/msg)", which busy-waits to mimic real per-message rendering. Set the latter to 1ms, run `flood`
+at 25 per 50ms, and put 2000 events into one `burst` chunk:
+
+```bash
+pnpm demo:memory --seconds=12 --interval=50 --burst=25 --size=512 --handler=1 --yield=0
+pnpm demo:memory --seconds=12 --interval=50 --burst=25 --size=512 --handler=1 --yield=20
+```
+
+| `yieldEvery` | Longest burst block | Burst main-thread total | Events |
+| --- | --- | --- | --- |
+| `0` | **1467 ms** | 2032 ms | 2000 |
+| `20` | **117 ms** | 2046 ms | 2000 |
+
+The total work is identical — slicing saves no time — but the longest block drops by 12x. The
+residual ~117ms is not a slice-size artefact: `yieldEvery: 5` measures the same 117ms, because two
+seconds of backlog keeps rendering starved. Slicing only guarantees there is no single runaway task.
+
+`overflowPolicy` is exposed too (the "Drop oversized messages instead of closing" checkbox). Tick it
+and run `huge`: the connection stays `open`, only that message is discarded, and the log shows an
+`overflow` row with the running count. Unticked, it is the old `protocol` error plus `closed`.
 
 ## Notes
 

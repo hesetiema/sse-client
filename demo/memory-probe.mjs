@@ -44,6 +44,10 @@ const SIZE = Number(args.get("size") ?? 1024);
 // client's 1MB message cap, so it measures parse cost rather than the overflow path.
 const BURST_EVENTS = Number(args.get("burst-events") ?? 2000);
 const BURST_SIZE = Number(args.get("burst-size") ?? 200);
+/** yieldEvery: how many events the client parses per task before yielding (0 = no slicing). */
+const YIELD = Number(args.get("yield") ?? 0);
+/** Simulated per-message handler cost in ms; makes main-thread blocking visible. */
+const HANDLER_MS = Number(args.get("handler") ?? 0);
 const SAMPLE_EVERY = Math.max(500, Number(args.get("sample") ?? 2000));
 const ONLY = args.get("only");
 const JSON_OUT = args.get("json");
@@ -272,6 +276,9 @@ function applyConfig(config) {
     ${set("rotate", 0)}
     ${set("maxRetry", 0)}
     ${set("ttl", 600000)}
+    ${set("yieldEvery", config.yield ?? YIELD)}
+    ${set("handlerMs", config.handler ?? HANDLER_MS)}
+    ${check("overflowDrop", config.drop ?? false)}
     ${check("pauseHidden", false)}
     ${check("refreshToken", false)}
     ${check("reconnectOnEnd", true)}
@@ -288,6 +295,9 @@ async function runFlood(cdp) {
   const started = Date.now();
   const samples = [];
   let longest = 0;
+  // Frame history is per phase: a stale gap from the previous phase would be
+  // attributed to the wrong one.
+  await evaluate(cdp, "window.__frames = []; true");
 
   while (Date.now() - started < SECONDS * 1000) {
     await sleep(SAMPLE_EVERY);
@@ -369,6 +379,7 @@ async function runBurstCase(cdp) {
   // A single write carrying BURST_EVENTS frames: the client parses it in one task.
   const events = BURST_EVENTS;
   const taskStart = await snapshot(cdp);
+  await evaluate(cdp, "window.__frames = []; true");
   await evaluate(
     cdp,
     applyConfig({ scenario: "burst", interval: 1000, burst: BURST_EVENTS, size: BURST_SIZE }),
@@ -493,7 +504,8 @@ for (const browser of BROWSERS) {
   const megabytesPerSecond = ((perSecond * SIZE) / MB).toFixed(2);
   console.log(
     `\n=== ${browser.label} === flood: ${BURST} × ${SIZE}B every ${INTERVAL}ms ` +
-      `(target ≈ ${perSecond} events/s ≈ ${megabytesPerSecond} MB/s) for ${SECONDS}s`,
+      `(target ≈ ${perSecond} events/s ≈ ${megabytesPerSecond} MB/s) for ${SECONDS}s ` +
+      `· yieldEvery=${YIELD} · handler=${HANDLER_MS}ms`,
   );
   const { child, info, profile } = await launchBrowser(browser, port);
   const { cdp, errors } = await openPage(port);
@@ -504,7 +516,11 @@ for (const browser of BROWSERS) {
     await collectGarbage(cdp);
     const baseline = await snapshot(cdp);
     baseline.dom = (await readPage(cdp)).dom;
-    console.log(`baseline: heap ${(baseline.heap / MB).toFixed(1)} MB · dom ${baseline.dom} nodes`);
+    const yieldApi = await evaluate(cdp, "typeof globalThis.scheduler?.yield");
+    console.log(
+      `baseline: heap ${(baseline.heap / MB).toFixed(2)} MB · dom ${baseline.dom} nodes · ` +
+        `scheduler.yield=${yieldApi}`,
+    );
 
     const flood = await measurePhase(cdp, "flood", SECONDS);
 

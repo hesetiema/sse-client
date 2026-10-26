@@ -24,12 +24,15 @@ const I18N = {
     "field.ttl": "token TTL (ms)",
     "field.burst": "burst (flood / burst)",
     "field.size": "payload bytes (flood / burst)",
+    "field.yield": "yieldEvery (0 = off)",
+    "field.handler": "handler cost (ms/msg)",
     "endpoint.direct": "Direct :8787 (no gateway)",
     "endpoint.nginx": "Nginx :8081 (correct)",
     "endpoint.broken": "Nginx :8082 (misconfigured)",
     "opt.pauseHidden": "pauseWhenHidden (suspend in background)",
     "opt.refreshToken": "Refresh token on 401, then retry",
     "opt.reconnectOnEnd": "Reconnect when the server ends the stream",
+    "opt.overflowDrop": "Drop oversized messages instead of closing (overflowPolicy: drop)",
     "btn.connect": "Connect",
     "btn.restart": "Restart (keep lastEventId)",
     "btn.close": "Close",
@@ -48,6 +51,7 @@ const I18N = {
     "log.networkHint": "is the demo server running? try pnpm demo:server",
     "log.unauthorizedHint": "token expired? tick 'Refresh token on 401' or click Connect again",
     "log.sampled": "log sampled: {n} events were not rendered (rate {rate}/s)",
+    "log.overflow": "oversized message dropped ({count} so far), the connection stays open",
     "mem.title": "Memory sampler",
     "mem.rate": "rate",
     "mem.delta": "Δ heap",
@@ -68,12 +72,15 @@ const I18N = {
     "field.ttl": "token 有效期（ms）",
     "field.burst": "每批条数（flood / burst）",
     "field.size": "单条字节（flood / burst）",
+    "field.yield": "每 N 条让出（0 = 关）",
+    "field.handler": "处理耗时（ms/条）",
     "endpoint.direct": "直连 :8787（无网关）",
     "endpoint.nginx": "Nginx :8081（正确配置）",
     "endpoint.broken": "Nginx :8082（故意配错）",
     "opt.pauseHidden": "后台挂起（pauseWhenHidden）",
     "opt.refreshToken": "401 时自动刷新 token 再重试",
     "opt.reconnectOnEnd": "服务端结束流后自动重连",
+    "opt.overflowDrop": "超限消息丢弃、不断开（overflowPolicy: drop）",
     "btn.connect": "连接",
     "btn.restart": "重启（保留 lastEventId）",
     "btn.close": "关闭",
@@ -92,6 +99,7 @@ const I18N = {
     "log.networkHint": "服务端没起来？先跑 pnpm demo:server",
     "log.unauthorizedHint": "token 过期了？勾选「401 时自动刷新 token」或再点一次「连接」",
     "log.sampled": "日志降采样：{n} 条事件未渲染（速率 {rate}/s）",
+    "log.overflow": "已丢弃超限消息（累计 {count} 条），连接保持",
     "mem.title": "内存采样",
     "mem.rate": "速率",
     "mem.delta": "堆变化",
@@ -110,7 +118,7 @@ const HINTS = {
     end: "With 'Reconnect when the server ends the stream' on it reconnects; turn it off and status becomes closed with reason=end.",
     done: "After data: [DONE] the client should close immediately, with no reconnect and no JSON parse error.",
     "retry-field": "The server sends retry: 2000, so the reconnect after the drop should wait about 2s (compare log timestamps).",
-    huge: "A 2MB message exceeds the 1MB default: expect a protocol error, closed, no reconnect and no memory growth.",
+    huge: "A 2MB message exceeds the 1MB default: expect a protocol error, closed, no reconnect and no memory growth. Tick 'Drop oversized messages' and the connection survives, discarding only that message.",
     "no-blank-line":
       "Data lines without a terminating blank line: past 1MB the client should report a protocol error (older builds kept growing the buffer).",
     slow: "Headers arrive after 3s: watch how long connecting lasts; a gateway's default 60s read timeout would cut it.",
@@ -119,9 +127,9 @@ const HINTS = {
     error500: "Expect exponential backoff until maxRetry is exhausted, then closed.",
     error401: "By default one request then closed; tick 'Refresh token on 401' to swap the token and recover.",
     flood:
-      "Sustained pressure: burst × interval (default 10 per 20ms ≈ 500 events/s). Watch the sampler: heap should saw-tooth and return to its baseline after Close, and dom must stay flat.",
+      "Sustained pressure: burst × interval (default 10 per 20ms ≈ 500 events/s). Watch the sampler: heap should saw-tooth and return to its baseline after Close, and dom must stay flat. Set yieldEvery to 50 to cut the long tasks.",
     burst:
-      "2000 frames in one write ≈ 400KB: one synchronous parse task. Watch the event loop stall and the saw-tooth, not a leak.",
+      "2000 frames in one write ≈ 400KB: one synchronous parse task. Watch the event loop stall and the saw-tooth, not a leak; set yieldEvery and the parse is sliced across tasks.",
   },
   zh: {
     normal: "事件应按间隔实时到达。再切到「Nginx :8082」对比：那边会卡住，直到网关缓冲区写满才吐出来。",
@@ -131,7 +139,7 @@ const HINTS = {
     end: "勾选「服务端结束流后自动重连」→ 会自动重连；取消勾选 → status 变 closed，原因为 end。",
     done: "收到 data: [DONE] 后应立即 closed，不重连，也不报 JSON 解析错误。",
     "retry-field": "服务端下发 retry: 2000：断流后应等约 2 秒再重连，看两条日志的时间差。",
-    huge: "单条 2MB 超过默认 1MB 上限：应报 protocol 错误并 closed，不重连、不吃内存。",
+    huge: "单条 2MB 超过默认 1MB 上限：应报 protocol 错误并 closed，不重连、不吃内存。勾选「超限消息丢弃、不断开」后连接保持，只丢这一条。",
     "no-blank-line": "只发 data 行、永不空行：累计超过 1MB 后应报 protocol 错误（旧版本会一路涨内存）。",
     slow: "3 秒后才回响应头：观察 connecting 停留时间；网关默认 60s 读超时会直接断开。",
     accel: "服务端带 X-Accel-Buffering: no：能绕过 8082 的 proxy_buffering，但 gzip 仍可能造成延迟。",
@@ -139,9 +147,9 @@ const HINTS = {
     error500: "应进入指数退避重连，直到 maxRetry 用尽后 closed。",
     error401: "默认只请求一次就 closed；勾选「401 时自动刷新 token」后应先换 token 再重连成功。",
     flood:
-      "持续压力：每批条数 × 间隔（默认 10 条 / 20ms ≈ 500 条/秒）。看采样面板：堆应是锯齿形，点「关闭」后回落到基线；dom 必须保持平直。",
+      "持续压力：每批条数 × 间隔（默认 10 条 / 20ms ≈ 500 条/秒）。看采样面板：堆应是锯齿形，点「关闭」后回落到基线；dom 必须保持平直。把「每 N 条让出」设成 50 可消除长任务。",
     burst:
-      "一次写入 2000 帧 ≈ 400KB：单个同步解析任务。应看到主线程停顿与锯齿，而不是持续上涨。",
+      "一次写入 2000 帧 ≈ 400KB：单个同步解析任务。应看到主线程停顿与锯齿，而不是持续上涨；设了「每 N 条让出」后解析会被切片。",
   },
 };
 
@@ -295,6 +303,18 @@ function log(kind, title, detail) {
 function preview(data) {
   const text = typeof data === "string" ? data : JSON.stringify(data);
   return text.length > 220 ? `${text.slice(0, 220)}…` : text;
+}
+
+/**
+ * Stand-in for real per-message work (rendering, store writes). It has to block
+ * the task to be a fair test: an `await` here would yield on its own and hide
+ * exactly what `yieldEvery` is about.
+ */
+function busyWait(ms) {
+  const end = performance.now() + ms;
+  while (performance.now() < end) {
+    // deliberate busy loop
+  }
 }
 
 /* ---------------- memory sampler ---------------- */
@@ -542,6 +562,7 @@ function connect() {
   resetMetrics();
 
   const scenario = $("scenario").value || "normal";
+  const handlerMs = Number($("handlerMs").value) || 0;
   const params = new URLSearchParams({
     scenario,
     interval: $("interval").value || "1000",
@@ -560,6 +581,8 @@ function connect() {
     parse: (raw) => JSON.parse(raw),
     idleTimeout: Number($("idle").value) || 0,
     rotateInterval: Number($("rotate").value) || 0,
+    yieldEvery: Number($("yieldEvery").value) || 0,
+    overflowPolicy: $("overflowDrop").checked ? "drop" : "close",
     reconnectOnEnd: $("reconnectOnEnd").checked,
     pauseWhenHidden: $("pauseHidden").checked,
     endSignal: "[DONE]",
@@ -577,10 +600,12 @@ function connect() {
       log("error", `error #${attempt}`, hintText ? `${head} · ${hintText}` : head);
     },
     onClose: (reason, error) => log("close", "close", error ? `${reason} · ${error.message}` : reason),
+    onOverflow: (dropped) => log("system", "overflow", t("log.overflow", { count: dropped })),
     onMessage: (message) => {
       eventCount += 1;
       metrics.bytes += message.raw?.length ?? 0;
       $("count").textContent = String(eventCount);
+      if (handlerMs > 0) busyWait(handlerMs);
       if (!allowLogRow()) return;
       log("msg", message.event, `id=${message.id || "-"} ${preview(message.data)}`);
     },

@@ -175,9 +175,11 @@ function applyConfig(config) {
     ${set("rotate", config.rotate ?? 0)}
     ${set("maxRetry", config.maxRetry ?? 2)}
     ${set("ttl", config.ttl ?? 60000)}
+    ${set("yieldEvery", config.yieldEvery ?? 0)}
     ${check("pauseHidden", config.pauseHidden)}
     ${check("refreshToken", config.refreshToken)}
     ${check("reconnectOnEnd", config.reconnectOnEnd ?? true)}
+    ${check("overflowDrop", config.overflowDrop)}
     document.getElementById("connect").click();
     return true;
   })()`;
@@ -261,6 +263,24 @@ const SCENARIOS = [
     check: (ui) => [
       ui.text.includes("protocol") && ui.status === "closed",
       `status=${ui.status} protocol=${ui.text.includes("protocol")}`,
+    ],
+  },
+  {
+    id: "overflow-drop",
+    title: "2MB dropped, stream survives",
+    // The oversized message must cost exactly one message, not the connection:
+    // the stream then ends normally (reason=end), never with a protocol error.
+    config: {
+      endpoint: "direct",
+      scenario: "huge",
+      interval: 500,
+      overflowDrop: true,
+      reconnectOnEnd: false,
+    },
+    wait: 2600,
+    check: (ui) => [
+      ui.status === "closed" && ui.text.includes("overflow") && !ui.text.includes("protocol"),
+      `status=${ui.status} overflowRow=${ui.text.includes("overflow")} protocol=${ui.text.includes("protocol")}`,
     ],
   },
   {
