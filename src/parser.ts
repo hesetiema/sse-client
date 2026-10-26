@@ -11,24 +11,45 @@ export interface ParsedEvent {
 /** Default cap for a single message buffer: 1MB. */
 export const DEFAULT_MAX_BUFFER_SIZE = 1024 * 1024;
 
+/**
+ * What to do when one message exceeds `maxBufferSize`:
+ * - `close` (default): stop parsing, the client treats it as a terminal protocol error;
+ * - `drop`: discard that message, count it in `dropped` and keep reading. The
+ *   parser resynchronises on the next blank line, so a stream that never sends
+ *   one cannot be resynced — it stays in drop mode and reports a single drop.
+ */
+export type OverflowPolicy = "close" | "drop";
+
 export interface SSEParserOptions {
   onEvent?: (event: ParsedEvent) => void;
   /** Reconnect delay requested by the server through a `retry:` field, in milliseconds. */
   onRetry?: (delay: number) => void;
   /** Buffer cap in characters (default 1MB). Once exceeded, parsing stops and `overflowed` flips to true. */
   maxBufferSize?: number;
+  /** Reaction to an oversized message, defaults to `"close"`. */
+  overflowPolicy?: OverflowPolicy;
 }
 
 export interface SSEParser {
-  /** Feed decoded text. Chunks may split lines or fields arbitrarily; partial input is buffered. */
-  feed: (chunk: string) => void;
+  /**
+   * Feed decoded text. Chunks may split lines or fields arbitrarily; partial input is buffered.
+   * `budget` caps the work of a single call: the parser stops after that many events and sets
+   * `stalled`, so the caller can yield to the event loop and call `feed("")` to continue.
+   */
+  feed: (chunk: string, budget?: number) => void;
   /** Drop any partial line and per-connection `id`/`event` state (called before a reconnect). */
   reset: () => void;
-  /** Whether the buffer cap was hit (server never terminates a line, or a single message is huge). */
+  /** Whether the buffer cap was hit under the `close` policy (server never ends a line, or a message is huge). */
   readonly overflowed: boolean;
+  /** Whether the last `feed` stopped on its budget with buffered input left. */
+  readonly stalled: boolean;
+  /** Oversized messages discarded so far; lifetime counter, not cleared by `reset()`. */
+  readonly dropped: number;
 }
 
 const LINE_BREAK = /\r\n|\r|\n/;
+/** A stream of blank lines dispatches nothing, so the budget also caps lines: 8x, same order of magnitude. */
+const LINES_PER_EVENT = 8;
 
 /**
  * Create an SSE frame parser (a subset of the WHATWG spec).
@@ -39,6 +60,7 @@ const LINE_BREAK = /\r\n|\r|\n/;
  */
 export function createSSEParser(options: SSEParserOptions = {}): SSEParser {
   const maxBufferSize = options.maxBufferSize ?? DEFAULT_MAX_BUFFER_SIZE;
+  const overflowPolicy = options.overflowPolicy ?? "close";
 
   let buffer = "";
   let isFirstChunk = true;
@@ -47,8 +69,27 @@ export function createSSEParser(options: SSEParserOptions = {}): SSEParser {
   let eventType = "";
   let lastId = "";
   let overflowed = false;
+  let stalled = false;
+  /** Inside an oversized event that must be discarded up to the next blank line. */
+  let dropping = false;
+  let dropped = 0;
+  /** Events dispatched by the current `feed` call, for the budget check. */
+  let eventsThisCall = 0;
+
+  const resetEvent = () => {
+    dataLines = [];
+    dataSize = 0;
+    eventType = "";
+  };
 
   const dispatch = () => {
+    if (dropping) {
+      // The oversized event just ended; resume from the next event boundary.
+      dropping = false;
+      resetEvent();
+      eventsThisCall += 1;
+      return;
+    }
     if (!dataLines.length) {
       // Per spec, an event without `data:` is discarded.
       eventType = "";
@@ -59,10 +100,22 @@ export function createSSEParser(options: SSEParserOptions = {}): SSEParser {
       event: eventType,
       data: dataLines.join("\n"),
     };
-    dataLines = [];
-    dataSize = 0;
-    eventType = "";
+    resetEvent();
+    eventsThisCall += 1;
     options.onEvent?.(event);
+  };
+
+  /** A message exceeded the cap: either stop for good, or throw it away and resync. */
+  const overflow = () => {
+    if (overflowPolicy === "drop") {
+      // Counted here rather than at the blank line: a stream that never sends one
+      // would otherwise look clean while swallowing everything.
+      dropped += 1;
+      dropping = true;
+      resetEvent();
+      return;
+    }
+    overflowed = true;
   };
 
   const handleLine = (line: string) => {
@@ -73,6 +126,9 @@ export function createSSEParser(options: SSEParserOptions = {}): SSEParser {
     }
     // Lines starting with a colon are comments (usually heartbeats); ignore them.
     if (line.startsWith(":")) {
+      return;
+    }
+    if (dropping) {
       return;
     }
     const colonIndex = line.indexOf(":");
@@ -91,7 +147,9 @@ export function createSSEParser(options: SSEParserOptions = {}): SSEParser {
         // keeps sending data lines without ever terminating the event would
         // grow the payload without bound.
         if (dataSize > maxBufferSize) {
-          overflowed = true;
+          dataLines = [];
+          dataSize = 0;
+          overflow();
         }
         break;
       case "event":
@@ -116,17 +174,34 @@ export function createSSEParser(options: SSEParserOptions = {}): SSEParser {
     get overflowed() {
       return overflowed;
     },
-    feed(chunk: string) {
-      if (!chunk || overflowed) {
+    get stalled() {
+      return stalled;
+    },
+    get dropped() {
+      return dropped;
+    },
+    feed(chunk: string, budget = 0) {
+      if (overflowed) {
         return;
       }
-      // Strip a UTF-8 BOM from the first chunk.
-      if (isFirstChunk) {
-        isFirstChunk = false;
-        buffer = chunk.charCodeAt(0) === 0xfeff ? chunk.slice(1) : chunk;
-      } else {
-        buffer += chunk;
+      if (chunk) {
+        // Strip a UTF-8 BOM from the first chunk.
+        if (isFirstChunk) {
+          isFirstChunk = false;
+          buffer = chunk.charCodeAt(0) === 0xfeff ? chunk.slice(1) : chunk;
+        } else {
+          buffer += chunk;
+        }
+      } else if (!stalled) {
+        // Nothing to continue with.
+        return;
       }
+      stalled = false;
+
+      const eventLimit = budget > 0 ? budget : 0;
+      const lineLimit = budget > 0 ? budget * LINES_PER_EVENT : 0;
+      eventsThisCall = 0;
+      let lines = 0;
 
       for (;;) {
         if (overflowed) {
@@ -145,14 +220,20 @@ export function createSSEParser(options: SSEParserOptions = {}): SSEParser {
         }
         handleLine(buffer.slice(0, match.index));
         buffer = buffer.slice(match.index + match[0].length);
+        lines += 1;
+        // Stop on the budget and let the caller decide when to continue: this is
+        // what keeps a 5000-event chunk from becoming one long blocking task.
+        if (eventLimit && (eventsThisCall >= eventLimit || lines >= lineLimit)) {
+          stalled = true;
+          break;
+        }
       }
 
       // No line break for far too long means the payload is not valid SSE:
       // stop early instead of growing the buffer until the process dies.
       if (!overflowed && buffer.length > maxBufferSize) {
-        overflowed = true;
         buffer = "";
-        dataLines = [];
+        overflow();
       }
     },
     reset() {
@@ -162,6 +243,9 @@ export function createSSEParser(options: SSEParserOptions = {}): SSEParser {
       eventType = "";
       lastId = "";
       overflowed = false;
+      stalled = false;
+      dropping = false;
+      eventsThisCall = 0;
     },
   };
 }

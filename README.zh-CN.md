@@ -143,6 +143,8 @@ const connected = computed(() => status.value === "open");
 | `stableAfter` | `number` | `10000` | 一次连接存活超过该时长后重置重试计数 |
 | `strictContentType` | `boolean` | `true` | 要求响应为 `content-type: text/event-stream` |
 | `maxBufferSize` | `number` | `1MB` | 单条消息缓冲区上限（字符数） |
+| `overflowPolicy` | `"close" \| "drop"` | `"close"` | 超限时：断开（终态 `protocol` 错误）或只丢该条、连接继续 |
+| `yieldEvery` | `number` | `0` | 每个任务最多解析多少条事件，然后让出主线程；`0` 表示整块一次处理 |
 | `endSignal` | `string` | — | 把这个 `data` 值视为流结束，例如 `"[DONE]"` |
 | `events` | `string[]` | — | 事件名白名单 |
 | `pauseWhenHidden` | `boolean` | `false` | 页面隐藏时挂起，页面可见时重连 |
@@ -151,7 +153,7 @@ const connected = computed(() => status.value === "open");
 | `onHandlerError` | `(error) => void` | `console.error` | 回调抛错时的兜底处理 |
 
 生命周期钩子既可以通过选项传入（`onOpen`、`onMessage`、`onStatus`、`onError`、
-`onClose`），也可以稍后用方法订阅，两种写法等价。
+`onClose`、`onOverflow`），也可以稍后用方法订阅，两种写法等价。
 
 #### 属性
 
@@ -161,6 +163,7 @@ const connected = computed(() => status.value === "open");
 | `closed` | `boolean` | 终态；为 `true` 时不会再重连 |
 | `attempts` | `number` | 连续重试次数，连接稳定后重置 |
 | `lastEventId` | `string` | 最新事件 id，重连时会带回服务端 |
+| `dropped` | `number` | 因超限被丢弃的消息数（`overflowPolicy: "drop"` 时才会增长） |
 | `done` | `Promise<void>` | 连接终止时兑现，永不 reject |
 
 #### 方法
@@ -173,7 +176,7 @@ const connected = computed(() => status.value === "open");
 | `on(event, handler)` | 订阅单个事件名，返回取消订阅函数 |
 | `on("*", handler)` | 订阅所有消息 |
 | `once(event, handler)` | 只订阅一次投递 |
-| `onMessage` / `onStatus` / `onError` / `onOpen` / `onClose` | 生命周期订阅 |
+| `onMessage` / `onStatus` / `onError` / `onOpen` / `onClose` / `onOverflow` | 生命周期订阅 |
 
 ### `SSEMessage`
 
@@ -244,11 +247,15 @@ import { createBatcher } from "@songfreedom/sse-client";
 const batcher = createBatcher<string, Point>({
   key: (point) => `${point.objectId}::${point.code}`,
   interval: 300,
+  maxPending: 2000, // 窗口内最多攒 2000 个实体
   onFlush: (points) => store.applyPoints(points),
 });
 
 client.on("IOT", (payload) => payload.data.forEach((p) => batcher.push(p)));
 ```
+
+`maxPending` 缺省不设上限；一旦触发上限，淘汰**最久没有被更新**的 key，丢弃数记在 `batcher.dropped`。
+`dispose()` 之后 `push()` 变成空操作并计数，避免组件卸载后回调又把定时器重新拉起来。
 
 ### 高频与大流量：内存会不会涨
 
@@ -256,9 +263,10 @@ client.on("IOT", (payload) => payload.data.forEach((p) => batcher.push(p)));
 
 1. **网络层**：读循环是 pull 模型（`await reader.read()`），处理慢了就不拉下一块，浏览器停止消费 socket，
    TCP 窗口耗尽后服务端 `write()` 阻塞——背压天然传导到上游，不需要额外的流控协议。
-2. **解析层**：`buffer` 与「一个事件累计的 data 行」都受 `maxBufferSize`（默认 1MB）约束，超了直接
-   `protocol` 错误并断开。这是硬保护，不是"丢弃旧数据"策略：`huge`（单条 2MB）与 `no-blank-line`
-   （永不空行）两个场景走的就是这里。
+2. **解析层**：`buffer` 与「一个事件累计的 data 行」都受 `maxBufferSize`（默认 1MB）约束，超了默认
+   报 `protocol` 错误并断开。这是硬保护，不是"丢弃旧数据"策略：`huge`（单条 2MB）与 `no-blank-line`
+   （永不空行）两个场景走的就是这里。如果业务能接受丢帧但不能断，改成 `overflowPolicy: "drop"`：
+   只丢掉超限的那条（`dropped` 计数、`onOverflow` 回调），连接继续，并在下一个空行边界重新对齐。
 3. **应用层**：库自己不保存历史，消息派发完即可回收。要涨只能是业务囤：数组、响应式 store、日志表。
 
 实测（demo 里的 `flood` 场景 + `pnpm demo:memory`，Chrome 单 tab）：30 秒灌入 **368 MB**、48,000 条事件，
@@ -266,6 +274,29 @@ client.on("IOT", (payload) => payload.data.forEach((p) => batcher.push(p)));
 不是泄漏。细节与复现脚本见 [`demo/README.zh-CN.md`](./demo/README.zh-CN.md#6-高频--内存实测)。
 
 需要自己兜住的两件事：处理函数里别囤数据；单条消息都很大时，可以调低 `maxBufferSize` 让异常更早暴露。
+
+### 长任务：让出主线程
+
+`feed()` 是同步的：一个 chunk 里有多少条事件，就在同一个任务里解析并派发多少条。解析本身很便宜
+（实测约 3–10µs/条），真正会把主线程卡住的是**你自己的处理函数**——一条 1ms 的渲染乘以一个 chunk 里的
+1500 条，就是一次 1.4 秒的卡顿。`yieldEvery` 在解析和派发之间切片：
+
+```ts
+new SSEClient({ url, yieldEvery: 20 }); // 每 20 条让出一次，再继续
+```
+
+让出用 `scheduler.yield()`（不可用时退回 `setTimeout(0)`），abort 期间被打断与 `reader.read()` 的表现一致。
+
+demo 实测（`pnpm demo:memory --handler=1`，每条事件模拟 1ms 处理耗时，单块灌入 2000 条）：
+
+| `yieldEvery` | 单次最长阻塞 | 主线程总耗时 | 收到事件 |
+| --- | --- | --- | --- |
+| `0` | **1467 ms** | 2032 ms | 2000 |
+| `20` | **117 ms** | 2046 ms | 2000 |
+
+总工作量不变（切片不省时间），但最长阻塞降到 1/12。注意残余的 ~117ms 不是切片粒度造成的——把
+`yieldEvery` 调到 5 也是 117ms：2 秒的总积压会持续压住渲染，切片只能保证"没有单次超长任务"。
+要彻底不卡，得减少每条的渲染成本或做批量合并（见上面的 `createBatcher`）。
 
 ### 轮转与重连的区别
 

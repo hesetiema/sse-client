@@ -88,3 +88,82 @@ describe("createSSEParser frame parsing", () => {
     expect(parser.overflowed).toBe(true);
   });
 });
+
+describe("createSSEParser work budget", () => {
+  it("stops after the budget, then continues on feed('') without losing anything", () => {
+    const events: ParsedEvent[] = [];
+    const parser = createSSEParser({ onEvent: (event) => events.push(event) });
+    const chunk = Array.from({ length: 5 }, (_, i) => `id: ${i + 1}\ndata: ${i + 1}\n\n`).join("");
+
+    parser.feed(chunk, 2);
+    expect(events).toHaveLength(2);
+    expect(parser.stalled).toBe(true);
+
+    let rounds = 0;
+    while (parser.stalled) {
+      parser.feed("", 2);
+      rounds += 1;
+      expect(rounds).toBeLessThan(10);
+    }
+
+    expect(events.map((event) => event.data)).toEqual(["1", "2", "3", "4", "5"]);
+    expect(parser.stalled).toBe(false);
+  });
+
+  it("does not stall when the budget is larger than the chunk", () => {
+    const parser = createSSEParser({});
+    parser.feed("data: a\n\ndata: b\n\n", 100);
+    expect(parser.stalled).toBe(false);
+  });
+
+  it("bounds a chunk that dispatches nothing but blank lines", () => {
+    // events stay at 0, so only the line cap can stop this
+    const parser = createSSEParser({});
+    parser.feed("\n".repeat(1000), 1);
+    expect(parser.stalled).toBe(true);
+  });
+});
+
+describe("createSSEParser overflow policy", () => {
+  it("drop discards the oversized message and keeps the stream alive", () => {
+    const events: ParsedEvent[] = [];
+    const parser = createSSEParser({
+      maxBufferSize: 64,
+      overflowPolicy: "drop",
+      onEvent: (event) => events.push(event),
+    });
+
+    parser.feed(`data: ${"x".repeat(200)}\n\n`);
+    expect(parser.overflowed).toBe(false);
+    expect(parser.dropped).toBe(1);
+
+    parser.feed("data: after\n\n");
+    expect(events).toEqual([{ id: "", event: "", data: "after" }]);
+  });
+
+  it("drop swallows the payload up to the next blank line and resyncs", () => {
+    const events: ParsedEvent[] = [];
+    const parser = createSSEParser({
+      maxBufferSize: 32,
+      overflowPolicy: "drop",
+      onEvent: (event) => events.push(event),
+    });
+
+    for (let i = 0; i < 10; i += 1) {
+      parser.feed(`data: ${"x".repeat(20)}\n`);
+    }
+    // still inside the oversized event: nothing delivered, one drop recorded
+    expect(parser.dropped).toBe(1);
+    expect(events).toHaveLength(0);
+
+    parser.feed("\nid: 3\ndata: good\n\n");
+    expect(events).toEqual([{ id: "3", event: "", data: "good" }]);
+  });
+
+  it("drop keeps counting when a message is huge but has no event boundary", () => {
+    const parser = createSSEParser({ maxBufferSize: 32, overflowPolicy: "drop" });
+    parser.feed(`data: ${"x".repeat(5000)}`);
+    expect(parser.dropped).toBe(1);
+    expect(parser.overflowed).toBe(false);
+  });
+});

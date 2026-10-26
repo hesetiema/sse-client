@@ -144,6 +144,8 @@ or a qiankun sub-app, closes the connection.
 | `stableAfter` | `number` | `10000` | An attempt that lived this long resets the retry counter |
 | `strictContentType` | `boolean` | `true` | Require `content-type: text/event-stream` |
 | `maxBufferSize` | `number` | `1MB` | Cap for a single message buffer (characters) |
+| `overflowPolicy` | `"close" \| "drop"` | `"close"` | On overflow: disconnect with a terminal `protocol` error, or drop that message and keep streaming |
+| `yieldEvery` | `number` | `0` | Parse at most this many events per task, then yield; `0` keeps a whole chunk in one task |
 | `endSignal` | `string` | — | Treat this `data` value as end-of-stream, e.g. `"[DONE]"` |
 | `events` | `string[]` | — | Allow-list of event names |
 | `pauseWhenHidden` | `boolean` | `false` | Suspend while the page is hidden, reconnect when visible |
@@ -152,7 +154,7 @@ or a qiankun sub-app, closes the connection.
 | `onHandlerError` | `(error) => void` | `console.error` | Fallback when a callback throws |
 
 Lifecycle hooks can be passed as options (`onOpen`, `onMessage`, `onStatus`, `onError`,
-`onClose`) or subscribed later; both forms are equivalent.
+`onClose`, `onOverflow`) or subscribed later; both forms are equivalent.
 
 #### Properties
 
@@ -162,6 +164,7 @@ Lifecycle hooks can be passed as options (`onOpen`, `onMessage`, `onStatus`, `on
 | `closed` | `boolean` | Terminal state; the client will not reconnect |
 | `attempts` | `number` | Consecutive retries; resets after a stable connection |
 | `lastEventId` | `string` | Latest event id, sent back on reconnect |
+| `dropped` | `number` | Messages discarded by the cap (only grows with `overflowPolicy: "drop"`) |
 | `done` | `Promise<void>` | Resolves when the connection terminates; never rejects |
 
 #### Methods
@@ -174,7 +177,7 @@ Lifecycle hooks can be passed as options (`onOpen`, `onMessage`, `onStatus`, `on
 | `on(event, handler)` | Subscribe to one event name; returns an unsubscribe function |
 | `on("*", handler)` | Subscribe to every message |
 | `once(event, handler)` | Subscribe for a single delivery |
-| `onMessage` / `onStatus` / `onError` / `onOpen` / `onClose` | Lifecycle subscriptions |
+| `onMessage` / `onStatus` / `onError` / `onOpen` / `onClose` / `onOverflow` | Lifecycle subscriptions |
 
 ### `SSEMessage`
 
@@ -245,11 +248,16 @@ import { createBatcher } from "@songfreedom/sse-client";
 const batcher = createBatcher<string, Point>({
   key: (point) => `${point.objectId}::${point.code}`,
   interval: 300,
+  maxPending: 2000, // at most 2000 entities per window
   onFlush: (points) => store.applyPoints(points),
 });
 
 client.on("IOT", (payload) => payload.data.forEach((p) => batcher.push(p)));
 ```
+
+`maxPending` is unlimited by default; when it is reached the entry that has not been updated for the
+longest time is evicted, and the count shows up in `batcher.dropped`. After `dispose()`, `push()`
+becomes a no-op (also counted), so a late callback cannot restart the timer.
 
 ### High frequency and large payloads: does memory grow?
 
@@ -259,9 +267,11 @@ Not without bound, as long as the three caps are in place:
    next read, the browser stops draining the socket, and the exhausted TCP window blocks the
    server's `write()`. Backpressure propagates upstream without any extra flow-control protocol.
 2. **Parser.** The line `buffer` and the accumulated `data` lines of one event are both capped by
-   `maxBufferSize` (1MB by default); exceeding it raises a `protocol` error and disconnects. That
-   is a hard stop, not a "drop the oldest" policy — the `huge` and `no-blank-line` demo scenarios
-   exercise exactly this path.
+   `maxBufferSize` (1MB by default); exceeding it raises a `protocol` error and disconnects by
+   default — the `huge` and `no-blank-line` demo scenarios exercise that path. If losing a message
+   is acceptable but disconnecting is not, use `overflowPolicy: "drop"`: only that message is
+   discarded (counted in `dropped`, reported through `onOverflow`), the connection stays open and
+   the parser resynchronises on the next blank line.
 3. **Application.** The client keeps no history: a message is collectable as soon as it is
    dispatched. Growth only comes from what your code retains — arrays, reactive stores, log tables.
 
@@ -272,6 +282,33 @@ script are in [`demo/README.md`](./demo/README.md#6-high-frequency--memory-measu
 
 Two things remain yours to handle: do not accumulate messages in the handler, and lower
 `maxBufferSize` if every message is large and you want anomalies to surface sooner.
+
+### Long tasks: yielding the main thread
+
+`feed()` is synchronous: a chunk carrying N events parses and dispatches all N in the same task.
+Parsing itself is cheap (measured at roughly 3–10µs per event); what actually blocks the page is
+**your handler** — 1ms of rendering per message times 1500 messages in one chunk is a 1.4s stall.
+`yieldEvery` slices between parse and dispatch:
+
+```ts
+new SSEClient({ url, yieldEvery: 20 }); // parse 20 events, yield, continue
+```
+
+Yielding uses `scheduler.yield()` when available and falls back to `setTimeout(0)`; an abort during
+the pause behaves exactly like an abort inside `reader.read()`.
+
+Measured in the demo (`pnpm demo:memory --handler=1`, 1ms simulated work per message, 2000 events
+in one chunk):
+
+| `yieldEvery` | Longest single block | Total main-thread time | Events |
+| --- | --- | --- | --- |
+| `0` | **1467 ms** | 2032 ms | 2000 |
+| `20` | **117 ms** | 2046 ms | 2000 |
+
+The total work is identical (slicing does not save time) but the longest block drops by 12x. Note
+that the residual ~117ms is not a slice-size artefact — `yieldEvery: 5` measures the same 117ms:
+two seconds of backlog keeps rendering starved, so slicing only guarantees "no single runaway task".
+To stop the jank entirely, reduce the per-message cost or coalesce (see `createBatcher` above).
 
 ### Rotation vs reconnect
 

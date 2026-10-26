@@ -10,6 +10,7 @@
  * const batcher = createBatcher<number, Point>({
  *   key: (p) => p.pointId,
  *   interval: 300,
+ *   maxPending: 2000, // never hold more than 2000 entities in one window
  *   onFlush: (points) => store.applyPoints(points),
  * });
  * client.on("IOT", (p) => batcher.push(p));
@@ -20,8 +21,14 @@ export interface BatcherOptions<K, V> {
   key: (value: V) => K;
   /** Coalescing window in milliseconds (default 300). */
   interval?: number;
-  /** Called once per window with the latest value per key, in first-seen order. */
+  /** Called once per window with the latest value per key, ordered by their last push. */
   onFlush: (values: V[]) => void;
+  /**
+   * Cap on pending entries, unlimited by default. When the window is full the
+   * key pushed least recently is evicted, so a burst of unique keys cannot grow
+   * the buffer without bound — the count is reported through `dropped`.
+   */
+  maxPending?: number;
 }
 
 export interface Batcher<V> {
@@ -31,22 +38,33 @@ export interface Batcher<V> {
   flush: () => void;
   /** Drop pending values without flushing. */
   clear: () => void;
-  /** Flush and release the timer (call on unmount). */
+  /** Flush and release the timer (call on unmount). Further `push` calls are ignored. */
   dispose: () => void;
   /** Number of values waiting to be flushed. */
   readonly pending: number;
+  /** Values evicted by `maxPending`, plus values pushed after `dispose()`. */
+  readonly dropped: number;
+  /** Whether `dispose()` has been called. */
+  readonly disposed: boolean;
 }
 
 export function createBatcher<K, V>(options: BatcherOptions<K, V>): Batcher<V> {
   const interval = options.interval ?? 300;
+  const maxPending = Math.max(1, options.maxPending ?? Infinity);
   const buffer = new Map<K, V>();
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let dropped = 0;
+  let disposed = false;
 
-  const flush = () => {
+  const cancel = () => {
     if (timer) {
       clearTimeout(timer);
       timer = null;
     }
+  };
+
+  const flush = () => {
+    cancel();
     if (!buffer.size) {
       return;
     }
@@ -57,7 +75,25 @@ export function createBatcher<K, V>(options: BatcherOptions<K, V>): Batcher<V> {
 
   return {
     push(value: V) {
-      buffer.set(options.key(value), value);
+      if (disposed) {
+        // A late callback after unmount must not resurrect the timer.
+        dropped += 1;
+        return;
+      }
+      const key = options.key(value);
+      // Re-insert so eviction follows the last update, not the first sighting.
+      if (buffer.has(key)) {
+        buffer.delete(key);
+      }
+      buffer.set(key, value);
+      while (buffer.size > maxPending) {
+        const oldest = buffer.keys().next();
+        if (oldest.done) {
+          break;
+        }
+        buffer.delete(oldest.value);
+        dropped += 1;
+      }
       if (timer) {
         return;
       }
@@ -68,17 +104,21 @@ export function createBatcher<K, V>(options: BatcherOptions<K, V>): Batcher<V> {
     },
     flush,
     clear() {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
+      cancel();
       buffer.clear();
     },
     dispose() {
       flush();
+      disposed = true;
     },
     get pending() {
       return buffer.size;
+    },
+    get dropped() {
+      return dropped;
+    },
+    get disposed() {
+      return disposed;
     },
   };
 }

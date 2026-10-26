@@ -2,6 +2,7 @@ import { SSEError, isRetryableStatus, toSSEError } from "./errors.js";
 import {
   DEFAULT_MAX_BUFFER_SIZE,
   createSSEParser,
+  type OverflowPolicy,
   type ParsedEvent,
   type SSEParser,
 } from "./parser.js";
@@ -74,6 +75,19 @@ export interface SSEClientOptions {
   /** Cap for a single message buffer in characters, defaults to 1MB, guards against runaway streams. */
   maxBufferSize?: number;
   /**
+   * What an oversized message does, defaults to `"close"`:
+   * `close` ends the connection with a terminal `protocol` error, `drop` discards
+   * that message, reports it through `onOverflow`, and keeps streaming.
+   */
+  overflowPolicy?: OverflowPolicy;
+  /**
+   * Dispatch at most this many events per task, then yield to the event loop.
+   * A single chunk carrying thousands of events would otherwise parse and
+   * deliver all of them in one task, blocking rendering and input. `0` (default)
+   * keeps the whole chunk in one task. Values between 1 and 500 are sensible.
+   */
+  yieldEvery?: number;
+  /**
    * Stream-end sentinel: when `data` equals this value the stream is treated as
    * finished (OpenAI / AI SDK style `[DONE]`) and no reconnect happens.
    * Disabled by default.
@@ -103,6 +117,11 @@ export interface SSEClientOptions {
   onError?: (error: SSEError, attempt: number) => void;
   /** Fired once when the connection is finally closed. Same as `client.onClose()`. */
   onClose?: (reason: SSECloseReason, error?: SSEError) => void;
+  /**
+   * Fired when a message is discarded because of `overflowPolicy: "drop"`.
+   * Receives the cumulative drop count for this client.
+   */
+  onOverflow?: (dropped: number) => void;
 }
 
 const EVENT_STREAM_CONTENT_TYPE = "text/event-stream";
@@ -155,6 +174,9 @@ export class SSEClient<E extends object = SSEEventMap> {
   private readonly errorHandlers = new Set<(error: SSEError, attempt: number) => void>();
   private readonly openHandlers = new Set<(response: Response) => void>();
   private readonly closeHandlers = new Set<(reason: SSECloseReason, error?: SSEError) => void>();
+  private readonly overflowHandlers = new Set<(dropped: number) => void>();
+  /** Last reported drop count, so `onOverflow` fires once per drop instead of once per chunk. */
+  private lastDropped = 0;
 
   constructor(options: SSEClientOptions) {
     if (!options?.url) {
@@ -163,6 +185,7 @@ export class SSEClient<E extends object = SSEEventMap> {
     this.options = options;
     this.parser = createSSEParser({
       maxBufferSize: options.maxBufferSize ?? DEFAULT_MAX_BUFFER_SIZE,
+      overflowPolicy: options.overflowPolicy ?? "close",
       onEvent: (event) => this.handleParsedEvent(event),
       onRetry: (delay) => {
         this.serverRetryDelay = delay;
@@ -174,6 +197,7 @@ export class SSEClient<E extends object = SSEEventMap> {
     if (options.onError) this.onError(options.onError);
     if (options.onOpen) this.onOpen(options.onOpen);
     if (options.onClose) this.onClose(options.onClose);
+    if (options.onOverflow) this.onOverflow(options.onOverflow);
     if (options.autoStart !== false) {
       this.start();
     }
@@ -197,6 +221,11 @@ export class SSEClient<E extends object = SSEEventMap> {
   /** Latest event id, sent back as `Last-Event-ID` on reconnect. */
   get lastEventId(): string {
     return this.lastEventIdValue;
+  }
+
+  /** Messages discarded under `overflowPolicy: "drop"` so far. */
+  get dropped(): number {
+    return this.parser.dropped;
   }
 
   /** Resolves when the connection terminates (closed or retries exhausted). Never rejects. */
@@ -324,6 +353,11 @@ export class SSEClient<E extends object = SSEEventMap> {
 
   onClose(handler: (reason: SSECloseReason, error?: SSEError) => void): Unsubscribe {
     return subscribe(this.closeHandlers, handler);
+  }
+
+  /** Subscribe to discarded oversized messages (see `overflowPolicy`). */
+  onOverflow(handler: (dropped: number) => void): Unsubscribe {
+    return subscribe(this.overflowHandlers, handler);
   }
 
   // ---------------------------------------------------------------------------
@@ -504,6 +538,8 @@ export class SSEClient<E extends object = SSEEventMap> {
     const decoder = new TextDecoder("utf-8");
     this.armIdle();
 
+    const yieldEvery = this.options.yieldEvery ?? 0;
+
     try {
       for (;;) {
         const { done, value } = await reader.read();
@@ -511,17 +547,18 @@ export class SSEClient<E extends object = SSEEventMap> {
           break;
         }
         this.armIdle();
-        this.parser.feed(decoder.decode(value, { stream: true }));
-        if (this.parser.overflowed) {
-          // The server never terminates a line, or a single message is huge;
-          // reconnecting would not help.
-          throw new SSEError("SSE buffer size limit exceeded, connection reset", {
-            kind: "protocol",
-            retryable: false,
-          });
+        this.parser.feed(decoder.decode(value, { stream: true }), yieldEvery);
+        // With a budget the parser stops mid-chunk: yield, then continue. This is
+        // what keeps a chunk carrying thousands of events out of a single task.
+        while (this.parser.stalled) {
+          await this.yieldToEventLoop(signal);
+          this.parser.feed("", yieldEvery);
+          this.reportOverflow();
         }
+        this.reportOverflow();
       }
       this.parser.feed(decoder.decode());
+      this.reportOverflow();
     } finally {
       try {
         reader.releaseLock();
@@ -530,6 +567,39 @@ export class SSEClient<E extends object = SSEEventMap> {
       }
       this.clearIdle();
       this.clearRotate();
+    }
+  }
+
+  /**
+   * Hand control back to the page between parser budget slices. `scheduler.yield()`
+   * keeps the work at the front of the queue; setTimeout is the fallback, and an
+   * abort during the pause is reported exactly like an abort inside `reader.read()`.
+   */
+  private async yieldToEventLoop(signal: AbortSignal): Promise<void> {
+    const schedulerLike = (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler;
+    if (typeof schedulerLike?.yield === "function") {
+      await schedulerLike.yield();
+    } else {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    if (signal.aborted) {
+      throw new DOMException("The operation was aborted.", "AbortError");
+    }
+  }
+
+  /** Report discarded messages, and turn an overflow into a terminal error under the "close" policy. */
+  private reportOverflow(): void {
+    if (this.parser.dropped !== this.lastDropped) {
+      this.lastDropped = this.parser.dropped;
+      this.emit(this.overflowHandlers, this.lastDropped);
+    }
+    if (this.parser.overflowed) {
+      // The server never terminates a line, or a single message is huge;
+      // reconnecting would not help.
+      throw new SSEError("SSE buffer size limit exceeded, connection reset", {
+        kind: "protocol",
+        retryable: false,
+      });
     }
   }
 

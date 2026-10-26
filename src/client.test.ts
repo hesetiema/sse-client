@@ -498,6 +498,58 @@ describe("SSEClient protocol robustness", () => {
     expect(onError.mock.calls[0][0].retryable).toBe(false);
   });
 
+  it("overflowPolicy drop discards the oversized message and keeps streaming", async () => {
+    const huge = `data: ${"x".repeat(2048)}\n\n`;
+    const fetchMock = vi.fn((_url: string, init: RequestInit) =>
+      Promise.resolve(hangingResponse(init, [huge, "id: 2\ndata: ok\n\n"])),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const received: string[] = [];
+    const onOverflow = vi.fn();
+    const onError = vi.fn();
+    const client = new SSEClient({
+      url: "/s",
+      maxBufferSize: 1024,
+      overflowPolicy: "drop",
+      onOverflow,
+      onError,
+      onMessage: (message) => received.push(message.raw),
+    });
+
+    await vi.waitFor(() => expect(received).toEqual(["ok"]));
+    expect(client.dropped).toBe(1);
+    expect(onOverflow).toHaveBeenCalledWith(1);
+    expect(onError).not.toHaveBeenCalled();
+    expect(client.status).toBe("open");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    client.close();
+    await client.done;
+  });
+
+  it("yieldEvery slices a large chunk across tasks and keeps the order", async () => {
+    const yieldMock = vi.fn(() => Promise.resolve());
+    vi.stubGlobal("scheduler", { yield: yieldMock });
+
+    const chunk = Array.from({ length: 6 }, (_, i) => `id: ${i + 1}\ndata: ${i + 1}\n\n`).join("");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(textResponse([chunk])));
+
+    const received: string[] = [];
+    const client = new SSEClient({
+      url: "/s",
+      yieldEvery: 2,
+      reconnectOnEnd: false,
+      onMessage: (message) => received.push(message.raw),
+    });
+    await client.done;
+
+    expect(received).toEqual(["1", "2", "3", "4", "5", "6"]);
+    // 6 events in slices of 2 need at least two pauses before the last slice.
+    expect(yieldMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(client.lastEventId).toBe("6");
+  });
+
   it("the events allow-list dispatches only listed names but still advances lastEventId", async () => {
     vi.stubGlobal(
       "fetch",

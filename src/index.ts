@@ -4,7 +4,7 @@ export type { FetchLike, RetryContext, RetryPolicy, SSEClientOptions } from "./c
 export { SSEError, isRetryableStatus, toSSEError } from "./errors.js";
 
 export { createSSEParser } from "./parser.js";
-export type { ParsedEvent, SSEParser, SSEParserOptions } from "./parser.js";
+export type { OverflowPolicy, ParsedEvent, SSEParser, SSEParserOptions } from "./parser.js";
 
 export { createBatcher } from "./batch.js";
 export type { Batcher, BatcherOptions } from "./batch.js";
