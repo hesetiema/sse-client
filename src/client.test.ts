@@ -749,3 +749,64 @@ describe("SSEClient suspend and resume", () => {
   });
 });
 
+describe("SSEClient restart", () => {
+  it("reconnects instead of leaving the client closed", async () => {
+    const fetchMock = vi.fn((_url: string, init: RequestInit) =>
+      Promise.resolve(hangingResponse(init)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new SSEClient({ url: "/s" });
+    await vi.waitFor(() => expect(client.status).toBe("open"));
+
+    client.restart();
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(client.status).toBe("open"));
+    expect(client.closed).toBe(false);
+
+    client.close();
+    await client.done;
+  });
+
+  it("keeps Last-Event-ID across a restart", async () => {
+    const seen: (string | null)[] = [];
+    const fetchMock = vi.fn((_url: string, init: RequestInit) => {
+      seen.push(new Headers(init.headers).get("last-event-id"));
+      return Promise.resolve(hangingResponse(init, ["id: 7\ndata: a\n\n"]));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new SSEClient({ url: "/s" });
+    await vi.waitFor(() => expect(client.lastEventId).toBe("7"));
+
+    client.restart();
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    expect(seen[0]).toBeNull();
+    expect(seen[1]).toBe("7");
+    expect(client.lastEventId).toBe("7");
+
+    client.close();
+    await client.done;
+  });
+
+  it("close() cancels a queued restart", async () => {
+    const fetchMock = vi.fn((_url: string, init: RequestInit) =>
+      Promise.resolve(hangingResponse(init)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new SSEClient({ url: "/s" });
+    await vi.waitFor(() => expect(client.status).toBe("open"));
+
+    client.restart();
+    client.close();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(client.closed).toBe(true);
+    expect(client.status).toBe("closed");
+  });
+});
+

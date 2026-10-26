@@ -136,6 +136,8 @@ export class SSEClient<E extends object = SSEEventMap> {
   private rotating = false;
   /** Set when `suspend()` aborts the attempt, so the abort is not read as an error. */
   private suspendAbort = false;
+  /** Set by `restart()` while the old loop is still unwinding. */
+  private pendingRestart = false;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private rotateTimer: ReturnType<typeof setTimeout> | null = null;
   private cancelController = new AbortController();
@@ -233,12 +235,19 @@ export class SSEClient<E extends object = SSEEventMap> {
       })
       .finally(() => {
         this.running = false;
+        // Only now is it safe to start again: the old loop has fully exited.
+        if (this.pendingRestart && this.finished) {
+          this.pendingRestart = false;
+          this.start();
+        }
       });
     return this;
   }
 
   /** Close the connection and stop reconnecting. */
   close(): void {
+    // An explicit close must win over a queued restart.
+    this.pendingRestart = false;
     if (this.finished) {
       return;
     }
@@ -248,7 +257,14 @@ export class SSEClient<E extends object = SSEEventMap> {
   /** Reconnect after closing, keeping `lastEventId` so the server can resume. */
   restart(): this {
     this.close();
-    return this.start();
+    if (!this.running) {
+      return this.start();
+    }
+    // `close()` aborts the loop, but `running` only clears once that loop unwinds.
+    // Starting synchronously would hit the `running` guard in start() and do nothing,
+    // leaving the client closed for good; hand the restart to the loop exit instead.
+    this.pendingRestart = true;
+    return this;
   }
 
   /** Subscribe to one event name; returns an unsubscribe function. */
@@ -341,6 +357,7 @@ export class SSEClient<E extends object = SSEEventMap> {
     this.rotating = false;
     this.suspended = null;
     this.suspendAbort = false;
+    this.pendingRestart = false;
     this.serverRetryDelay = undefined;
     this.clearTimers();
     this.cancelController = new AbortController();
