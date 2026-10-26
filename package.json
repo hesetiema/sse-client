@@ -18,11 +18,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/hesetiema/simple-sse-client.git"
+    "url": "git+https://github.com/hesetiema/sse-client.git"
   },
-  "homepage": "https://github.com/hesetiema/simple-sse-client#readme",
+  "homepage": "https://github.com/hesetiema/sse-client#readme",
   "bugs": {
-    "url": "https://github.com/hesetiema/simple-sse-client/issues"
+    "url": "https://github.com/hesetiema/sse-client/issues"
   },
   "exports": {
     ".": "./src/index.ts",

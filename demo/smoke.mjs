@@ -3,7 +3,7 @@
 // "is this a client problem or a gateway problem?" from the command line / CI.
 //
 //   node demo/smoke.mjs
-//   DEMO_HOST=192.168.1.20 DEMO_PORT=8787 DEMO_NGINX=8081,8082 node demo/smoke.mjs
+//   DEMO_HOST=192.0.2.10 DEMO_PORT=8787 DEMO_NGINX=8081,8082 node demo/smoke.mjs
 import { SSEClient } from "../dist/index.js";
 
 const HOST = process.env.DEMO_HOST ?? "127.0.0.1";

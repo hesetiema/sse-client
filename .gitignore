@@ -3,3 +3,12 @@ dist/
 *.tgz
 *.log
 .DS_Store
+
+# Local secrets and machine state must never reach the repo.
+.env
+.env.*
+.npmrc
+*.local
+coverage/
+.idea/
+.vscode/
