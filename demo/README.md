@@ -10,10 +10,27 @@ and a real streaming response.
 | `server.mjs` | Dependency-free SSE server (`127.0.0.1:8787`): Bearer auth, `Last-Event-ID` resume, 16 fault/boundary/pressure scenarios |
 | `index.html` + `main.js` | Browser console: endpoint switch, scenario switch, every client option exposed, plus a memory sampler; the UI toggles between EN and 中文 |
 | `smoke.mjs` | Headless smoke test: direct / gateway / resume in one command, CI-friendly |
-| `browser-matrix.mjs` | Real Chrome / Edge automation: 11 scenarios over CDP, no Playwright |
+| `browser-matrix.mjs` | Real Chrome / Edge automation: 20 scenarios over CDP, no Playwright |
 | `memory-probe.mjs` | Memory pressure test: flood the stream, sample the heap over CDP, compare before/after GC |
+| `consumers-check.mjs` | Drives the four consumer pages in Chrome / Edge: role split + failover, F5 resume, 401 self-heal, tenant switch |
 | `nginx.conf` | Local Nginx: 8081 correct, 8082 deliberately broken |
 | `nginx.docker.conf` | Same for Docker, only the upstream address differs |
+| `consumers/` | Consumer examples: alarm center / point board / multi-tab / Vue shared subscription, organised by how the business layer consumes; every page has an editable config panel |
+
+## Index by business scenario
+
+Which demo to run for which business scenario (scenario parameters and expectations
+in [§ 3 Scenario expectations](#3-scenario-expectations)):
+
+| Business scenario | What to use here | Command |
+| --- | --- | --- |
+| Alarm centers / no event may be lost | `smoke.mjs`: `Last-Event-ID: 5` resume assertion (recovers at id=6) | `pnpm demo:smoke` |
+| Point data at scale / high-frequency collection | `memory-probe.mjs`: flood + burst + before/after-GC comparison (§ 6) | `pnpm demo:memory` |
+| Big screens / multiple tabs / background | browser-matrix: background suspend → resume, constructed-while-hidden (§ 5.1) | `pnpm demo:matrix` |
+| Mobile / flaky networks | browser-matrix: 0.8 s offline recovery, `silent` + `idleTimeout` (§ 5.1) | `pnpm demo:matrix` |
+| Gateway acceptance | 8081 correct vs 8082 broken contrast, `accel` upstream escape hatch (§ 2, § 4) | `pnpm demo:smoke` |
+| Render stalls / long tasks | `yieldEvery` A/B + per-message "handler cost" busy-wait (§ 6.1) | `pnpm demo:memory --handler=1 --yield=20` |
+| Auth expiry self-healing | Console "refresh token on 401" × `error401` scenario (§ 3) | `pnpm demo:server`, then manual |
 
 ## 1. Start the server
 
@@ -138,9 +155,12 @@ curl -N -X POST "http://localhost:8082/subscribe?scenario=normal&interval=500" \
 ```bash
 pnpm build && pnpm demo:server          # terminal 1
 docker run ...                          # terminal 2, see section 2
-pnpm demo:matrix                        # Chrome + Edge, 11 scenarios each
+pnpm demo:matrix                        # Chrome + Edge, 20 scenarios each
 pnpm demo:matrix --only=edge            # a single browser
 node demo/browser-matrix.mjs --shots=D:\shots   # custom screenshot dir (default %TEMP%\sse-matrix)
+
+pnpm demo:consumers                     # the four consumer pages, 12 assertions each
+pnpm demo:consumers --only=edge
 ```
 
 Drives real browsers over CDP with Node's built-in WebSocket, no Playwright:
@@ -158,8 +178,22 @@ Drives real browsers over CDP with Node's built-in WebSocket, no Playwright:
 | Offline 0.8s recovery | back to `open`, no `close error`, events keep growing |
 | Background suspend → resume | `idle` and silent while hidden, `open` and streaming after |
 | Constructed while hidden | 0 events/`idle` before, streaming after (P0 regression) |
+| Heartbeat comments + idleTimeout | 0 events (comments are not events), `heartbeat` error, ≥1 retry |
+| `retry:` field parsed | ≥2 events after the reconnect, no `protocol` error |
+| Unterminated event hits the cap | `protocol` error, `closed` (4KB lines, never a blank line) |
+| Slow headers | still `connecting` with 0 events after 2s |
+| 200 + text/html | `protocol` error, `closed`, exactly 1 attempt |
+| 500 retried, then exhausted | `closed` after ≥2 attempts |
+| 401 is terminal | `closed` after exactly 1 attempt |
+| accel `X-Accel-Buffering` | ≥4 events, `open` (header effect on :8082 left to the manual demo) |
 
-Last run: Chrome 155.0.8059.85 / Edge 155.0.4283.62, **22/22 PASS**, stable across repeated runs.
+`consumers-check.mjs` asserts what each example page exists to show: leader/follower
+split and promotion on leader close, tenant switch that changes the share key, the
+ring buffer filling under pressure, F5 resume (`skipped=1`, i.e. a clean join), and a
+revoked token healing itself through the 401 retry path.
+
+Last run: Chrome 155.0.8059.85 / Edge 155.0.4283.62, matrix **40/40 PASS**, consumer
+examples **20/20 PASS**, stable across repeated runs.
 
 Known limits:
 
@@ -248,8 +282,10 @@ residual ~117ms is not a slice-size artefact: `yieldEvery: 5` measures the same 
 seconds of backlog keeps rendering starved. Slicing only guarantees there is no single runaway task.
 
 `overflowPolicy` is exposed too (the "Drop oversized messages instead of closing" checkbox). Tick it
-and run `huge`: the connection stays `open`, only that message is discarded, and the log shows an
-`overflow` row with the running count. Unticked, it is the old `protocol` error plus `closed`.
+and run `huge`: the connection stays `open`, only that message is discarded, and the log shows a
+`gap` row with `reason: drop` — a dropped message is a continuity problem, not a transport one, so
+it is reported through the gap signal (`client.dropped` holds the count). Unticked, it is the old
+`protocol` error plus `closed`.
 
 ## Notes
 

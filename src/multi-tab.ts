@@ -1,6 +1,7 @@
 import { SSEClient, type SSEClientOptions } from "./client.js";
 import { SSEError, type SSEErrorKind } from "./errors.js";
 import { hashKey } from "./hash.js";
+import { normalizeOptions } from "./options.js";
 import type {
   SSECloseReason,
   SSEEventMap,
@@ -59,7 +60,7 @@ export interface MultiTabSSEDeps {
  * same `SSEMessage` objects and replay them to their own subscribers.
  *
  * ```ts
- * const sse = createMultiTabSSE({ url: "/api/push", body: { topics: ["iot"] } });
+ * const sse = createMultiTabSSE({ url: "/api/push", request: { body: { topics: ["iot"] } } });
  * sse.on("IOT", (point) => store.apply(point)); // every tab, one connection
  * ```
  *
@@ -95,7 +96,6 @@ export interface MultiTabSSE<E extends object = SSEEventMap> {
   onStatus: (handler: (status: SSEStatus) => void) => Unsubscribe;
   onError: (handler: (error: SSEError, attempt: number) => void) => Unsubscribe;
   onClose: (handler: (reason: SSECloseReason) => void) => Unsubscribe;
-  onOverflow: (handler: (dropped: number) => void) => Unsubscribe;
   /**
    * The stream may not be continuous — relayed from the leader, or reported
    * locally when this tab is promoted. A takeover leaves a window in which no tab
@@ -120,7 +120,6 @@ type Envelope =
   | { k: "status"; s: SSEStatus }
   | { k: "error"; e: { message: string; kind: SSEErrorKind; status?: number; retryable: boolean } }
   | { k: "close"; r: SSECloseReason }
-  | { k: "overflow"; n: number }
   | { k: "gap"; g: SSEGapInfo }
   | { k: "resume"; r: SSEResumeInfo };
 
@@ -129,16 +128,17 @@ export function createMultiTabSSE<E extends object = SSEEventMap>(
   deps: MultiTabSSEDeps = {},
 ): MultiTabSSE<E> {
   const { channel: channelOption, ...rest } = options;
+  // Flatten once: the relay bus owns the hooks, the client gets the rest.
+  const resolved = normalizeOptions(rest);
   const {
     onMessage: userOnMessage,
     onStatus: userOnStatus,
     onError: userOnError,
     onClose: userOnClose,
-    onOverflow: userOnOverflow,
     onSuspectGap: userOnSuspectGap,
     onResume: userOnResume,
     ...clientOptions
-  } = rest;
+  } = resolved;
 
   const reportHandlerError = (error: unknown) => {
     if (clientOptions.onHandlerError) {
@@ -165,7 +165,6 @@ export function createMultiTabSSE<E extends object = SSEEventMap>(
   const statusHandlers = new Set<(status: SSEStatus) => void>();
   const errorHandlers = new Set<(error: SSEError, attempt: number) => void>();
   const closeHandlers = new Set<(reason: SSECloseReason) => void>();
-  const overflowHandlers = new Set<(dropped: number) => void>();
   const gapHandlers = new Set<(info: SSEGapInfo) => void>();
   const resumeHandlers = new Set<(info: SSEResumeInfo) => void>();
   const roleHandlers = new Set<(role: MultiTabRole) => void>();
@@ -219,12 +218,6 @@ export function createMultiTabSSE<E extends object = SSEEventMap>(
     }
   };
 
-  const emitOverflow = (dropped: number): void => {
-    for (const handler of [...overflowHandlers]) {
-      safe(handler, dropped);
-    }
-  };
-
   const emitGap = (info: SSEGapInfo): void => {
     for (const handler of [...gapHandlers]) {
       safe(handler, info);
@@ -241,7 +234,6 @@ export function createMultiTabSSE<E extends object = SSEEventMap>(
   if (userOnStatus) statusHandlers.add(userOnStatus);
   if (userOnError) errorHandlers.add(userOnError);
   if (userOnClose) closeHandlers.add(userOnClose);
-  if (userOnOverflow) overflowHandlers.add(userOnOverflow);
   if (userOnSuspectGap) gapHandlers.add(userOnSuspectGap);
   if (userOnResume) resumeHandlers.add(userOnResume);
 
@@ -363,10 +355,6 @@ export function createMultiTabSSE<E extends object = SSEEventMap>(
         emitClose(reason);
         post({ k: "close", r: reason });
       },
-      onOverflow: (dropped) => {
-        emitOverflow(dropped);
-        post({ k: "overflow", n: dropped });
-      },
       onSuspectGap: (info) => {
         emitGap(info);
         post({ k: "gap", g: info });
@@ -398,7 +386,6 @@ export function createMultiTabSSE<E extends object = SSEEventMap>(
       onError: emitError,
       onMessage: emitMessage,
       onClose: emitClose,
-      onOverflow: emitOverflow,
       onSuspectGap: emitGap,
       onResume: emitResume,
     });
@@ -427,9 +414,6 @@ export function createMultiTabSSE<E extends object = SSEEventMap>(
         break;
       case "close":
         emitClose(envelope.r);
-        break;
-      case "overflow":
-        emitOverflow(envelope.n);
         break;
       case "gap":
         emitGap(envelope.g);
@@ -514,10 +498,6 @@ export function createMultiTabSSE<E extends object = SSEEventMap>(
       closeHandlers.add(handler);
       return () => closeHandlers.delete(handler);
     },
-    onOverflow(handler) {
-      overflowHandlers.add(handler);
-      return () => overflowHandlers.delete(handler);
-    },
     onSuspectGap(handler) {
       gapHandlers.add(handler);
       return () => gapHandlers.delete(handler);
@@ -549,7 +529,6 @@ export function createMultiTabSSE<E extends object = SSEEventMap>(
       statusHandlers.clear();
       errorHandlers.clear();
       closeHandlers.clear();
-      overflowHandlers.clear();
       gapHandlers.clear();
       roleHandlers.clear();
       eventHandlers.clear();

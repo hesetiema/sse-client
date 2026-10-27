@@ -1,9 +1,14 @@
 import { SSEError, isRetryableStatus, toSSEError } from "./errors.js";
+import {
+  normalizeOptions,
+  type ResolvedSSEClientOptions,
+  type RetryContext,
+  type SSEClientOptions,
+} from "./options.js";
 import { createFanout, type SseFanout } from "./fanout.js";
 import {
   DEFAULT_MAX_BUFFER_SIZE,
   createSSEParser,
-  type OverflowPolicy,
   type ParsedEvent,
   type SSEParser,
 } from "./parser.js";
@@ -25,9 +30,6 @@ import type {
   Unsubscribe,
 } from "./types.js";
 
-/** Same shape as `fetch`; inject a custom transport for SSR, tests or signed requests. */
-export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
-
 /**
  * A plugin attaches cross-cutting behaviour to a client — metrics, logging,
  * tracing, gap accounting — without every caller rebuilding the same wrapper.
@@ -36,186 +38,12 @@ export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
  */
 export type SsePlugin<E extends object = SSEEventMap> = (client: SSEClient<E>) => void | Unsubscribe;
 
-/** Context passed to a retry policy. */
-export interface RetryContext {
-  /** Retry number, starting at 1. */
-  attempt: number;
-  /** Why the reconnect happens; `undefined` when the server closed the stream normally. */
-  error?: SSEError;
-  /** How long the attempt was alive, in milliseconds. */
-  elapsed: number;
-}
-
-/**
- * Custom retry policy: return the delay in milliseconds before the next attempt,
- * or `false` to give up. May be async, which makes flows such as
- * "401 → refresh the token → retry" straightforward. When omitted, the built-in
- * exponential backoff with jitter and a max attempt count is used.
- */
-export type RetryPolicy = (
-  context: RetryContext,
-) => number | false | Promise<number | false>;
-
-/** Client options. */
-export interface SSEClientOptions {
-  /** Request URL (include your gateway prefix yourself). */
-  url: string;
-  /** HTTP method; business push endpoints usually use POST. */
-  method?: "GET" | "POST";
-  /**
-   * Request body. Serialized as JSON, or passed through when it is a string / Blob / FormData.
-   *
-   * Pass a function to recompute the body before every (re)connect — the same
-   * contract `headers` has. This is how a subscription follows reactive filters
-   * or instance ids without rebuilding the client:
-   * `body: () => [{ floorId: floor.value }]`.
-   */
-  body?: unknown;
-  /**
-   * `credentials` for the fetch call, defaults to `"same-origin"`.
-   * Use `"include"` when the SSE endpoint lives on another origin and
-   * authentication rides on cookies.
-   */
-  credentials?: RequestCredentials;
-  /**
-   * Valueless query flags appended to the URL: `["GRID_MAP"]` becomes
-   * `.../subscribe?GRID_MAP`. Common for gateways that switch payload shape on a
-   * bare flag. They are part of the share key, so two flag sets never share a
-   * connection by accident.
-   */
-  flags?: string[];
-  /**
-   * Extra headers. Pass a function to recompute them before every (re)connect,
-   * which is the recommended way to pick up a refreshed token:
-   * `() => getAuthHeaders()`.
-   */
-  headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
-  /** Payload decoder, e.g. `(raw) => JSON.parse(raw)`. Defaults to the raw string. */
-  parse?: (raw: string) => unknown;
-  /**
-   * Resume point for the very first request, sent as `Last-Event-ID`. Use it to
-   * continue where a previous page load stopped instead of starting fresh (which
-   * silently skips everything produced while the page was loading).
-   */
-  resumeFrom?: string;
-  /**
-   * Keep `lastEventId` across page loads. `true` derives a key from the
-   * subscription, a string is used as-is; without it the resume point lives in
-   * memory only and an F5 loses it.
-   *
-   * Writes are throttled to one per second and flushed on close and `pagehide`,
-   * so a fast stream does not turn into one synchronous storage write per message.
-   */
-  persistKey?: string | boolean;
-  /** Storage for `persistKey`; defaults to `sessionStorage`. Pass `null` to disable. */
-  persistStorage?: ResumeStorage | null;
-  /**
-   * Idle timeout in milliseconds: reconnect when no bytes arrived for this long.
-   * `0` disables it. Two to three times the server heartbeat interval is a good value.
-   */
-  idleTimeout?: number;
-  /** Proactive rotation interval in milliseconds: reconnect on schedule to avoid zombie connections. `0` disables it. */
-  rotateInterval?: number;
-  /**
-   * How `rotateInterval` is applied (default `"restart"`).
-   *
-   * - `restart`: close the current connection, then reopen it. Relies on `Last-Event-ID` to
-   *   resume; without server-side id support everything produced during the gap is lost.
-   * - `overlap`: open the candidate first and take it over as soon as it is accepted, so a
-   *   scheduled rotation never leaves a gap. A candidate that fails leaves the current
-   *   connection untouched instead of trading a working stream for a broken one.
-   */
-  rotateMode?: "restart" | "overlap";
-  /** How long to wait for the candidate before giving up on a rotation, defaults to 30000. */
-  rotateTimeout?: number;
-  /** Custom retry policy, overrides the built-in backoff. */
-  retry?: RetryPolicy;
-  /** Maximum retry count, unlimited by default (only used when `retry` is not provided). */
-  maxRetry?: number;
-  /** Delay before the first retry in milliseconds, defaults to 1000. */
-  retryBaseDelay?: number;
-  /** Upper bound for reconnect delays in milliseconds, defaults to 30000. */
-  retryMaxDelay?: number;
-  /** Reconnect when the server closes the stream normally, defaults to true. */
-  reconnectOnEnd?: boolean;
-  /** An attempt that lived at least this long resets the retry counter, defaults to 10000. */
-  stableAfter?: number;
-  /**
-   * Require the response `content-type` to be `text/event-stream`, defaults to true.
-   * This catches silent failures such as a gateway returning a 200 HTML page;
-   * disable it for non-compliant backends.
-   */
-  strictContentType?: boolean;
-  /** Cap for a single message buffer in characters, defaults to 1MB, guards against runaway streams. */
-  maxBufferSize?: number;
-  /**
-   * What an oversized message does, defaults to `"close"`:
-   * `close` ends the connection with a terminal `protocol` error, `drop` discards
-   * that message, reports it through `onOverflow`, and keeps streaming.
-   */
-  overflowPolicy?: OverflowPolicy;
-  /**
-   * Dispatch at most this many events per task, then yield to the event loop.
-   * A single chunk carrying thousands of events would otherwise parse and
-   * deliver all of them in one task, blocking rendering and input. `0` (default)
-   * keeps the whole chunk in one task. Values between 1 and 500 are sensible.
-   */
-  yieldEvery?: number;
-  /**
-   * Stream-end sentinel: when `data` equals this value the stream is treated as
-   * finished (OpenAI / AI SDK style `[DONE]`) and no reconnect happens.
-   * Disabled by default.
-   */
-  endSignal?: string;
-  /** Event allow-list: only these event names are dispatched. All events are dispatched when omitted. */
-  events?: string[];
-  /**
-   * Suspend the connection while the page is hidden and reconnect when it becomes
-   * visible again. Defaults to false; recommended for WebViews and mobile, where
-   * the OS freezes background pages and leaves zombie connections behind.
-   */
-  pauseWhenHidden?: boolean;
-  /** Connect in the constructor, defaults to true. */
-  autoStart?: boolean;
-  /** Inject a fetch implementation, defaults to the global `fetch`. */
-  fetch?: FetchLike;
-  /** Fallback when a handler throws, defaults to `console.error`. */
-  onHandlerError?: (error: unknown) => void;
-  /** Fired once the connection is established (response headers received). Same as `client.onOpen()`. */
-  onOpen?: (response: Response) => void;
-  /** Fired for every message. Same as `client.onMessage()`. */
-  onMessage?: (message: SSEMessage) => void;
-  /** Fired on every state change. Same as `client.onStatus()`. */
-  onStatus?: (status: SSEStatus) => void;
-  /** Fired for every failed attempt. Same as `client.onError()`. */
-  onError?: (error: SSEError, attempt: number) => void;
-  /** Fired once when the connection is finally closed. Same as `client.onClose()`. */
-  onClose?: (reason: SSECloseReason, error?: SSEError) => void;
-  /**
-   * Fired when a message is discarded because of `overflowPolicy: "drop"`.
-   * Receives the cumulative drop count for this client.
-   */
-  onOverflow?: (dropped: number) => void;
-  /**
-   * Fired when the stream may not be continuous — a reconnect, a resume after a
-   * hidden page or offline period, a `restart`-mode rotation, or a dropped
-   * message. The usual reaction is to refetch a snapshot and call
-   * `setResumePoint(snapshot.id)`; the client itself cannot tell what was missed.
-   *
-   * Fires at most once per episode: the flag resets when a connection opens
-   * again, so a long outage does not produce one report per retry.
-   */
-  onSuspectGap?: (info: SSEGapInfo) => void;
-  /**
-   * Fired once per connection, on the first event that carries an id after a
-   * request that sent `Last-Event-ID`. It answers the question `onSuspectGap`
-   * can only raise: *did* the server resume, and from where?
-   *
-   * `skipped` and `continuous` stay `undefined` when ids are not integers — the
-   * client refuses to guess an ordering it cannot know.
-   */
-  onResume?: (info: SSEResumeInfo) => void;
-}
+export type {
+  FetchLike,
+  RetryContext,
+  RetryPolicy,
+  SSEClientOptions,
+} from "./options.js";
 
 const EVENT_STREAM_CONTENT_TYPE = "text/event-stream";
 /** Prevents tight reconnect loops when the server drops the connection immediately. */
@@ -235,11 +63,10 @@ const PERSIST_THROTTLE = 1000;
  *   connections (see `acquireSSEClient`)
  */
 export class SSEClient<E extends object = SSEEventMap> {
-  private readonly options: SSEClientOptions;
+  /** Grouped options, flattened once by `normalizeOptions`. */
+  private readonly options: ResolvedSSEClientOptions;
   private readonly parser: SSEParser;
   private readonly eventFilter: Set<string> | null;
-  /** `url` with `flags` applied; the raw option is kept untouched for share keys. */
-  private readonly requestUrl: string;
   /** Memoised so repeated `fanout()` calls share one `"*"` subscription. */
   private fanoutInstance: SseFanout | null = null;
   private readonly pluginTeardowns = new Set<Unsubscribe>();
@@ -287,10 +114,9 @@ export class SSEClient<E extends object = SSEEventMap> {
   private readonly errorHandlers = new Set<(error: SSEError, attempt: number) => void>();
   private readonly openHandlers = new Set<(response: Response) => void>();
   private readonly closeHandlers = new Set<(reason: SSECloseReason, error?: SSEError) => void>();
-  private readonly overflowHandlers = new Set<(dropped: number) => void>();
   private readonly gapHandlers = new Set<(info: SSEGapInfo) => void>();
   private readonly resumeHandlers = new Set<(info: SSEResumeInfo) => void>();
-  /** Last reported drop count, so `onOverflow` fires once per drop instead of once per chunk. */
+  /** Last seen drop count, so each new drop reports one gap instead of one per chunk. */
   private lastDropped = 0;
   /** Set once a gap is reported; cleared when a connection opens again. */
   private gapReported = false;
@@ -302,37 +128,40 @@ export class SSEClient<E extends object = SSEEventMap> {
     if (!options?.url) {
       throw new Error("[sse-client] missing required option: url");
     }
-    this.options = options;
-    this.requestUrl = appendFlags(options.url, options.flags);
-    this.persistKey = options.persistKey
-      ? typeof options.persistKey === "string"
-        ? options.persistKey
-        : deriveResumeKey({ url: options.url, method: options.method, body: resolveBodyOption(options.body) })
+    const resolved = normalizeOptions(options);
+    this.options = resolved;
+    this.persistKey = resolved.persistKey
+      ? typeof resolved.persistKey === "string"
+        ? resolved.persistKey
+        : deriveResumeKey({
+            url: resolved.url,
+            method: resolved.method,
+            body: resolveBodyOption(resolved.body),
+          })
       : null;
     this.persistStorage = this.persistKey
-      ? resolveResumeStorage(options.persistStorage)
+      ? resolveResumeStorage(resolved.persistStorage)
       : null;
     // An explicit `resumeFrom` wins over what the previous page load stored.
     this.lastEventIdValue =
-      options.resumeFrom ?? readResumePoint(this.persistStorage, this.persistKey ?? "");
+      resolved.resumeFrom ?? readResumePoint(this.persistStorage, this.persistKey ?? "");
     this.parser = createSSEParser({
-      maxBufferSize: options.maxBufferSize ?? DEFAULT_MAX_BUFFER_SIZE,
-      overflowPolicy: options.overflowPolicy ?? "close",
+      maxBufferSize: resolved.maxBufferSize ?? DEFAULT_MAX_BUFFER_SIZE,
+      overflowPolicy: resolved.overflowPolicy ?? "close",
       onEvent: (event) => this.handleParsedEvent(event),
       onRetry: (delay) => {
         this.serverRetryDelay = delay;
       },
     });
-    this.eventFilter = options.events?.length ? new Set(options.events) : null;
-    if (options.onMessage) this.onMessage(options.onMessage);
-    if (options.onStatus) this.onStatus(options.onStatus);
-    if (options.onError) this.onError(options.onError);
-    if (options.onOpen) this.onOpen(options.onOpen);
-    if (options.onClose) this.onClose(options.onClose);
-    if (options.onOverflow) this.onOverflow(options.onOverflow);
-    if (options.onSuspectGap) this.onSuspectGap(options.onSuspectGap);
-    if (options.onResume) this.onResume(options.onResume);
-    if (options.autoStart !== false) {
+    this.eventFilter = resolved.events?.length ? new Set(resolved.events) : null;
+    if (resolved.onMessage) this.onMessage(resolved.onMessage);
+    if (resolved.onStatus) this.onStatus(resolved.onStatus);
+    if (resolved.onError) this.onError(resolved.onError);
+    if (resolved.onOpen) this.onOpen(resolved.onOpen);
+    if (resolved.onClose) this.onClose(resolved.onClose);
+    if (resolved.onSuspectGap) this.onSuspectGap(resolved.onSuspectGap);
+    if (resolved.onResume) this.onResume(resolved.onResume);
+    if (resolved.autoStart !== false) {
       this.start();
     }
   }
@@ -357,9 +186,9 @@ export class SSEClient<E extends object = SSEEventMap> {
     return this.lastEventIdValue;
   }
 
-  /** URL the client actually requests, `flags` already applied. */
+  /** URL the client requests. */
   get url(): string {
-    return this.requestUrl;
+    return this.options.url;
   }
 
   /** Messages discarded under `overflowPolicy: "drop"` so far. */
@@ -509,11 +338,6 @@ export class SSEClient<E extends object = SSEEventMap> {
 
   onClose(handler: (reason: SSECloseReason, error?: SSEError) => void): Unsubscribe {
     return subscribe(this.closeHandlers, handler);
-  }
-
-  /** Subscribe to discarded oversized messages (see `overflowPolicy`). */
-  onOverflow(handler: (dropped: number) => void): Unsubscribe {
-    return subscribe(this.overflowHandlers, handler);
   }
 
   /** Subscribe to "the stream may have skipped data" reports (see `onSuspectGap`). */
@@ -724,7 +548,9 @@ export class SSEClient<E extends object = SSEEventMap> {
       credentials: this.options.credentials ?? "same-origin",
     };
 
-    const response = fetchImpl ? await fetchImpl(this.requestUrl, init) : await fetch(this.requestUrl, init);
+    const response = fetchImpl
+      ? await fetchImpl(this.options.url, init)
+      : await fetch(this.options.url, init);
 
     if (!response.ok) {
       throw new SSEError(`SSE request failed: HTTP ${response.status}`, {
@@ -844,8 +670,9 @@ export class SSEClient<E extends object = SSEEventMap> {
   /** Report discarded messages, and turn an overflow into a terminal error under the "close" policy. */
   private reportOverflow(): void {
     if (this.parser.dropped !== this.lastDropped) {
+      // `dropped` is the counter; the loss itself is reported as a gap, which is
+      // the signal that survives sharing and multi-tab relaying.
       this.lastDropped = this.parser.dropped;
-      this.emit(this.overflowHandlers, this.lastDropped);
       this.reportGap("drop");
     }
     if (this.parser.overflowed) {
@@ -1406,27 +1233,6 @@ function parseRetryAfter(value: string | null): number | undefined {
 /** Resolve a body factory; static values pass through untouched. */
 function resolveBodyOption(body: unknown): unknown {
   return typeof body === "function" ? (body as () => unknown)() : body;
-}
-
-/**
- * Append valueless query flags to a URL: `["GRID_MAP"]` → `...?GRID_MAP`.
- * An existing query string is respected and the hash stays at the end.
- */
-function appendFlags(url: string, flags?: string[]): string {
-  if (!flags?.length) {
-    return url;
-  }
-  const cleaned = flags
-    .map(flag => String(flag).replace(/^[?&]+/, "").trim())
-    .filter(Boolean);
-  if (!cleaned.length) {
-    return url;
-  }
-  const hashAt = url.indexOf("#");
-  const base = hashAt === -1 ? url : url.slice(0, hashAt);
-  const hash = hashAt === -1 ? "" : url.slice(hashAt);
-  const separator = base.includes("?") ? "&" : "?";
-  return `${base}${separator}${cleaned.join("&")}${hash}`;
 }
 
 /** Serialize the body: strings / Blob / FormData pass through, everything else becomes JSON. */

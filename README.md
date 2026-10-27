@@ -15,8 +15,10 @@ import { SSEClient } from "@songfreedom/sse-client";
 
 const client = new SSEClient({
   url: "/api/push/subscribe",
-  body: { topics: ["alarm"] },
-  headers: () => ({ authorization: `Bearer ${getToken()}` }),
+  request: {
+    body: { topics: ["alarm"] },
+    headers: () => ({ authorization: `Bearer ${getToken()}` }),
+  },
   parse: (raw) => JSON.parse(raw),
 });
 
@@ -29,25 +31,150 @@ client.on("ALARM", (alarm) => console.log(alarm.level));
 | --- | --- |
 | Native `EventSource` | Cannot set request headers (no way to send an auth token), GET only, no request body, no control over reconnection |
 | [`@microsoft/fetch-event-source`](https://github.com/Azure/fetch-event-source) | Archived. Non-2xx responses must be rejected by hand in `onopen`, otherwise it silently reconnects forever; fixed retry interval; no `Last-Event-ID` persistence |
-| `axios` | Cannot read a streaming response in the browser (`responseType: "stream"` is Node-only). Concatenating `responseText` in `onDownloadProgress` corrupts multi-byte characters |
 
-This library is roughly 3 kB gzipped, has no runtime dependencies, and only needs `fetch`
-and `ReadableStream`.
+The core client is about 6 kB minified+gzipped, and about 9 kB for everything the `.`
+entry exports (sharing, fan-out, ring buffer, batcher). No runtime dependencies, and only
+`fetch` plus `ReadableStream` are required.
 
-## Features
+## Core pipeline: from data source to screen
 
-- **POST + JSON body**, arbitrary headers, and header functions re-evaluated on every reconnect
-- **Reconnects** with exponential backoff and jitter; terminal errors (401/403/404) stop immediately
-- **Resume** with `Last-Event-ID`, so a reconnect can pick up where it left off — and across reloads with `persistKey`
-- **Gap signal** (`onSuspectGap`): the client says when it cannot prove the stream was continuous, so the app can refetch a snapshot instead of showing a silently wrong number
-- **Resume verification** (`onResume`): after a reconnect it reports how far the new stream jumped (`skipped`, `continuous`), and stays quiet when ids are opaque
-- **Typed event routing**: one connection serves many subscribers, `on()` infers payload types from an event map
-- **Idle watchdog** for streams that go quiet, and **proactive rotation** for connections that stay open but stop receiving data
-- **Offline-aware**: pauses while the network is down, reconnects as soon as it is back
-- **Pluggable retry policy**, including async policies such as "refresh the token, then retry"
-- **Shared connections** by key with reference counting, and **one connection for every tab** (`./multi-tab`)
-- **Bounded history**: `createRingBuffer`, with `createBatcher` coalescing (optional leading edge) in front of it
-- Optional **Vue 3** composable in a separate entry point
+A typical industrial chain (the library covers only the last hop):
+
+```text
+Field devices / PLC ─► access gateway ─► message bus ─► stream compute ─► storage tiers ─► push service ─► Web
+ OPC UA/Modbus        MQTT/EMQX          Kafka          Flink           TSDB+Redis       SSE/WS         Vue/React
+```
+
+On the device side, OPC UA / Modbus is translated at the access gateway into MQTT (EMQX holds connections and QoS; the gateway buffers while the uplink is down) and bridged into Kafka through a rule engine or connector. Flink runs windowing and alarm rules; live events go straight to the push service while TSDB serves snapshots and history only. On the browser side the push service emits SSE — one-way, gateway-friendly, with `Last-Event-ID` resume; WebSocket only when you need a command channel. The two gateways are different things: the access gateway translates protocols, the HTTP gateway just forwards bytes without buffering.
+
+Module view (solid lines carry data, dashed lines carry control and governance):
+
+```mermaid
+flowchart TB
+    DEV["Field devices / PLC<br/>OPC UA · Modbus"] --> EDGE["Access gateway<br/>protocol translation · store-and-forward"]
+    EDGE -- "MQTT / EMQX" --> BUS["Message bus<br/>Kafka"]
+    BUS --> FLINK["Stream compute<br/>Flink · windowing · alarm rules"]
+    FLINK --> STORE["Storage tiers<br/>TSDB history · Redis latest values"]
+    FLINK -- "live events" --> SRV["Push service<br/>subscription routing · event ids · snapshots · heartbeats"]
+    STORE -- "snapshots / history" --> SRV
+    SRV --> GW["HTTP gateway: proxy_buffering off · gzip off · pass Last-Event-ID through"]
+
+    subgraph TRANSPORT["Transport · SSEClient: accuracy · timeliness"]
+        T1["fetch streaming<br/>POST + JSON · headers/body factories"] --> T2["Frame parsing: createSSEParser<br/>chunked input · CRLF · BOM · maxBufferSize caps"]
+        T2 --> T3["Decode + event routing<br/>streaming TextDecoder · on / once · events whitelist"]
+        T4["Resume + reconnect<br/>Last-Event-ID · persistKey · backoff + jitter · Retry-After<br/>idleTimeout watchdog · rotate rotation"] -. keeps alive, recovers .-> T1
+    end
+
+    subgraph FRONTEND["Frontend building blocks: memory · render cadence"]
+        F1["createBatcher micro-batching<br/>interval 300ms · maxPending · chunkSize"]
+        F2["fanout<br/>one subscription, many consumers · latest snapshot"]
+        F3["createRingBuffer bounded history<br/>overwrites oldest · evicted"]
+        F4["Vue 3: useSSE / useSharedSSE<br/>when gate · explicit dispose"]
+        F1 --> F2 --> F3
+    end
+
+    subgraph GOV["Connection governance: components · tabs"]
+        C1["acquireSSEClient: ref-counted sharing"]
+        C2["useSharedSSEClient: hot-swappable subscription · grace"]
+        C3["createMultiTabSSE: Web Locks election + BroadcastChannel relay"]
+    end
+
+    GW --> T1
+    T3 --> F1
+    F2 -.-> F4
+    F3 --> VIEW["Web display: trend charts · point lists · alarm centers · big screens"]
+    GOV -. consumers share one physical connection .- TRANSPORT
+```
+
+The library covers the last hop: `SSEClient` transports, `createBatcher` / `fanout()` / `createRingBuffer` consume. Three requirements, three sets of mechanisms:
+
+- **Accuracy**: `Last-Event-ID` resume + `onSuspectGap` / `onResume` to prove continuity; throwing `parse` calls and handlers are isolated; terminal 401/403/404 stop immediately.
+- **Timeliness**: streaming push + `idleTimeout` zombie reaping + exponential backoff (±20% jitter, `Retry-After` honoured) + gapless `overlap` rotation.
+- **Memory**: pull backpressure + `maxBufferSize` (1 MB by default) caps + fixed-capacity `createRingBuffer`; `yieldEvery` / `createBatcher` keep tasks short.
+
+## Capability map: transport · frontend · connection governance
+
+**Transport** — where accuracy, timeliness and memory are won or lost:
+
+- fetch transport: POST + JSON body, arbitrary headers; `headers` / `body` as functions are re-evaluated per (re)connect
+- Event routing: `on()` infers payload types from an event map, `on("*")` wildcard, `once()` single delivery
+- Frame parsing: arbitrarily chunked input, multi-line `data`, split CRLFs, BOM, comment heartbeats; `maxBufferSize` dual caps, `overflowPolicy: "close" | "drop"`
+- Resume: `Last-Event-ID` + `resume.persist` across reloads + `resume.from` seeding; `hooks.gap` / `hooks.resume` continuity signals
+- Reconnect governance: exponential backoff with jitter, `Retry-After` (delta-seconds and HTTP-date), in-stream `retry:`, async custom `retry`; terminal 401/403/404 stop immediately
+- Connection health: idle watchdog, scheduled rotation (`restart` / `overlap`), offline pause/resume, `pauseWhenHidden`, `endSignal` for clean shutdown
+
+**Frontend** — where display cadence and memory are decided:
+
+- `createBatcher` micro-batching: coalesce high-frequency updates per business key, keep only the latest per window (300 ms default; `maxPending` for memory, `chunkSize` against long tasks, `leading` for sparse panels)
+- `client.fanout()` fan-out: one subscription to many consumers, latest value kept per event, late-mounted components render immediately
+- `createRingBuffer` bounded history: O(1) push, overwrites oldest; answers "the last N values", not "the last T seconds"
+- Vue 3 `useSSE` / `useSharedSSE`: reactive `status` / `lastEvent`, a `when` readiness gate, explicit `dispose()` (no leaks even with two Vue copies in micro-frontends)
+- Building blocks: `createSSEParser` / `createSSEMessageStream` (a standard `TransformStream`) for custom transports
+
+**Connection governance** — many components and tabs without stepping on each other:
+
+- `acquireSSEClient` shares one connection per key (ref-counted) — no wasted fan-out under the HTTP/1.1 six-connections-per-origin limit
+- `useSharedSSEClient` hot-swaps subscriptions: listeners move on a key change; the old connection closes when its last consumer leaves
+- `createMultiTabSSE` (from `@songfreedom/sse-client/multi-tab`) one connection per browser: Web Locks leader election + BroadcastChannel relay, followers take over from `lastId` when the leader closes (a `promote` gap is reported), degrades to `solo` without the platform APIs
+- `createMockSSEFetch` from `@songfreedom/sse-client/testing`: deterministic in-process reproduction of reconnect / resume / hung gateways / rotation
+
+## Consumer examples
+
+How a business layer consumes the client lives in code: [`demo/consumers/`](./demo/consumers/README.md).
+Each page has an editable panel, so scenario, interval and the other knobs can be switched
+in the browser instead of the source.
+
+| Folder | Scenario | Building blocks |
+| --- | --- | --- |
+| `alarm-center/` | Alarm center: resume, 401 self-healing, dedupe by id | `SSEClient` · header factory · `retry` · `resume.persist` |
+| `point-board/` | Point dashboard: high-frequency points, one repaint per frame, bounded memory | `createBatcher` · `fanout()` · `createRingBuffer` · `yieldEvery` |
+| `multi-tab/` | One connection across tabs | `createMultiTabSSE` |
+| `vue-shared/` | Vue components sharing a connection, tenant switches | `useSharedSSE` · `subscription` getter |
+
+```bash
+pnpm build && pnpm demo:server
+# open http://127.0.0.1:8787/demo/consumers/<folder>/index.html
+```
+
+## Choosing a client
+
+The package exposes four subpaths — `.`, `./vue`, `./multi-tab`, `./testing` — but the
+choice inside them comes down to which of three things you are duplicating: the
+**consumer**, the **subscription**, or the **tab**.
+
+| What is duplicated | Use | What it costs you |
+| --- | --- | --- |
+| Nothing — one consumer, one fixed subscription | `new SSEClient(options)` | You own the lifecycle: `close()` on unmount |
+| Many components, **same** subscription | `acquireSSEClient(key, create)` | Ref-counted, so every consumer must `release()`; the subscription cannot change |
+| Many components, subscription **moves** (floor, tenant, filter) | `useSharedSSEClient({ grace })` | Listener bookkeeping is yours; a key switch closes the old connection immediately |
+| A Vue component | `useSSE(options)` / `useSharedSSE(options)` | Thin by design: refs, `on()`, `dispose()`. No history, no `configure` in `shared` mode |
+| The same stream in **many tabs** | `createMultiTabSSE(options)` from `./multi-tab` | Needs Web Locks **and** `BroadcastChannel`; payloads must be structured-cloneable |
+| Many consumers inside one tab, plus "what is the value right now?" | `client.fanout()` | Latest value only — it is not a store, and it keeps no history |
+| History, or a controlled repaint cadence | `createRingBuffer` + `createBatcher` | You pick the capacity and the interval; the library keeps no default |
+| Nothing — you only want to observe | `client.use(plugin)` | Attached once, torn down only on `close()`; not a hot-pluggable hook |
+
+The boundaries that are easy to get wrong:
+
+- **Sharing merges `parse`.** The key covers `url` / `method` / `body` / `events`,
+  and the *first* caller's `parse` wins — the second consumer silently receives whatever it
+  returns. Two consumers that decode differently need two keys.
+- **A key switch is not grace-protected.** `grace` only delays the release on `close()`
+  (route changes, remounts). `F1 → F2 → F1` is two reconnects; debounce the switch instead
+  of letting a slider emit one key per pixel.
+- **`fanout()` is not a store.** It keeps the *latest* payload per event name and nothing
+  else — no history, no window, no replay. It also keeps the underlying `"*"` subscription
+  after the last consumer unsubscribes, so `latest()` stays readable; only `dispose()`
+  releases it.
+- **A ring buffer is a count bound, not a time window.** It answers "the last N values",
+  never "the values of the last T seconds".
+- **A batcher changes cadence, not order.** With `leading: true` the first value of an idle
+  window is delivered immediately and is *not* part of the trailing flush; with
+  `chunkSize` set, `onFlush` is called once per slice, not once per window.
+- **`multi-tab` degrades, it does not fall back.** Without both platform APIs every tab
+  reports `solo` and opens its own connection. That is deliberate: a hand-rolled fallback
+  can split-brain.
+- **A plugin is attach-time, not lifecycle.** It runs when you call `use()`, and its
+  teardown runs on `close()` only — it cannot follow `start()` / `stop()` cycles.
 
 ## Installation
 
@@ -74,16 +201,17 @@ import { SSEClient } from "@songfreedom/sse-client";
 
 interface Events {
   ALARM: { level: "high" | "low"; deviceId: string };
-  IOT: { objectId: string; value: string };
+  POINT: { objectId: string; value: string };
 }
 
 const client = new SSEClient<Events>({
-  url: `${gateway}/server-event/sse/subscribe`,
-  method: "POST",
-  body: [{ subscribeType: "SE", instanceType: "PROJECT" }],
-  headers: () => authHeaders(),          // re-evaluated before every attempt
+  url: "/api/sse/subscribe",
+  request: {
+    body: { topics: ["alarm"] },
+    headers: () => authHeaders(),  // re-evaluated before every attempt
+  },
   parse: (raw) => JSON.parse(raw),
-  idleTimeout: 45_000,                   // if the server sends a heartbeat every 15s
+  stream: { idleTimeout: 45_000 }, // heartbeat every 15s
 });
 
 const off = client.on("ALARM", (alarm) => {
@@ -109,7 +237,7 @@ interface Events {
 
 const { status, lastEvent, on, dispose } = useSSE<Events>({
   url: "/api/push/alarm",
-  body: { topics: ["alarm"] },
+  request: { body: { topics: ["alarm"] } },
   parse: (raw) => JSON.parse(raw),
 });
 
@@ -121,24 +249,17 @@ const connected = computed(() => status.value === "open");
 </script>
 ```
 
-`useSSE` is deliberately thin: refs for `status` / `lastEvent` / `error`, `on()` for
-routing, and a `dispose()` that unsubscribes everything the composable registered and
-closes the connection.
+`useSSE` returns refs for `status` / `lastEvent` / `error`, an `on()` for routing, and a
+`dispose()` that unsubscribes what it registered and closes the connection. It keeps no
+history — compose that with `createRingBuffer`
+(see [`demo/consumers/point-board/`](./demo/consumers/point-board/main.js)).
 
-**There is no history array.** How many messages a view keeps, whether it downsamples
-them and how often it repaints are business decisions the library cannot make for you —
-a built-in default would quietly fit nobody. Compose the buffer with `createRingBuffer`
-(see [Large lists and charts](#large-lists-and-charts-compose-the-view-window)).
+Cleanup is explicit, not scope-based: `getCurrentScope()` returns `undefined` when the app
+and the library resolve *different copies* of Vue (qiankun sub-apps), which leaks the
+connection silently. `dispose()` is idempotent; `stop()` closes but keeps it usable.
 
-Cleanup is explicit rather than scope-based. `getCurrentScope()` returns `undefined`
-when the app and the library resolve *different copies* of Vue — the usual case in a
-qiankun sub-app — and the guarded call then leaks the connection silently. `dispose()`
-is idempotent, so calling it twice is harmless. `stop()` closes the connection but keeps
-the composable usable; `dispose()` is the real teardown.
-
-Pass `shared: true` (or `{ grace, keyOf }`) to put every component describing the same
-subscription on one connection: releases are reference counted, so one unmount no longer
-cuts the others off.
+`shared: true` (or `{ grace, keyOf }`) puts every component describing the same
+subscription on one connection, with reference-counted releases.
 
 Add `when` when the subscription target is not known yet. While it returns false no
 request is issued, so a detail page no longer opens a throwaway subscription for
@@ -149,7 +270,7 @@ const instanceId = ref<string>();
 const { status } = useSSE({
   url: "/api/push",
   when: () => !!instanceId.value,
-  body: () => [{ instanceId: instanceId.value }],
+  request: { body: () => [{ instanceId: instanceId.value }] },
 });
 ```
 
@@ -163,45 +284,49 @@ started.
 
 ### `new SSEClient(options)`
 
-| Option | Type | Default | Description |
-| --- | --- | --- | --- |
-| `url` | `string` | — | Request URL, including your gateway prefix |
-| `method` | `"GET" \| "POST"` | `"POST"` | HTTP method |
-| `body` | `unknown \| (() => unknown)` | — | Serialized as JSON; strings, `Blob` and `FormData` are sent as-is. A function is re-evaluated before every (re)connect, so filters can follow reactive state. Keep it pure: `deriveShareKey` resolves it too |
-| `credentials` | `RequestCredentials` | `"same-origin"` | Use `"include"` when the SSE endpoint is on another origin and auth rides on cookies |
-| `flags` | `string[]` | — | Valueless query flags appended to the URL: `["GRID_MAP"]` → `.../subscribe?GRID_MAP`. Part of the share key |
-| `headers` | `HeadersInit \| () => HeadersInit \| Promise<HeadersInit>` | — | Pass a function to recompute headers on every (re)connect |
-| `parse` | `(raw: string) => unknown` | identity | Payload decoder; `jsonParse` from the package keeps the raw text when a frame is not JSON |
-| `resumeFrom` | `string` | — | Resume point for the first request, sent as `Last-Event-ID`; use it to continue where a previous page load stopped |
-| `persistKey` | `string \| boolean` | — | Keep `lastEventId` in storage across reloads. `true` derives the key from the subscription; writes are throttled to 1/s and flushed on close and `pagehide` |
-| `persistStorage` | `ResumeStorage \| null` | `sessionStorage` | Where `persistKey` reads and writes; `null` disables it (SSR, sandboxed iframes) |
-| `onSuspectGap` | `(info: SSEGapInfo) => void` | — | The stream may not be continuous (`reconnect` / `resume` / `rotate` / `drop` / `promote`); fires once per episode |
-| `onResume` | `(info: SSEResumeInfo) => void` | — | First identified event after a reconnect: how far the new stream jumped (`skipped`, `continuous`) |
-| `idleTimeout` | `number` | `0` | Reconnect when no bytes arrive for this long. Set it to ~3× the heartbeat interval |
-| `rotateInterval` | `number` | `0` | Reconnect on a schedule, even if the connection looks healthy |
-| `rotateMode` | `"restart" \| "overlap"` | `"restart"` | `restart` reconnects; `overlap` takes over a pre-opened replacement instead (no gap) |
-| `rotateTimeout` | `number` | `30000` | Time budget for the replacement connection in `overlap` mode |
-| `retry` | `(ctx) => number \| false \| Promise<number \| false>` | — | Custom retry policy, overrides the built-in backoff |
-| `maxRetry` | `number` | `Infinity` | Retry limit (only when `retry` is omitted) |
-| `retryBaseDelay` | `number` | `1000` | Delay before the first retry (ms) |
-| `retryMaxDelay` | `number` | `30000` | Upper bound for backoff (ms) |
-| `reconnectOnEnd` | `boolean` | `true` | Reconnect when the server ends the stream normally |
-| `stableAfter` | `number` | `10000` | An attempt that lived this long resets the retry counter |
-| `strictContentType` | `boolean` | `true` | Require `content-type: text/event-stream` |
-| `maxBufferSize` | `number` | `1MB` | Cap for a single message buffer (characters) |
-| `overflowPolicy` | `"close" \| "drop"` | `"close"` | On overflow: disconnect with a terminal `protocol` error, or drop that message and keep streaming |
-| `yieldEvery` | `number` | `0` | Parse at most this many events per task, then yield; `0` keeps a whole chunk in one task |
-| `endSignal` | `string` | — | Treat this `data` value as end-of-stream, e.g. `"[DONE]"` |
-| `events` | `string[]` | — | Allow-list of event names |
-| `pauseWhenHidden` | `boolean` | `false` | Suspend while the page is hidden, reconnect when visible |
-| `autoStart` | `boolean` | `true` | Connect in the constructor |
-| `fetch` | `FetchLike` | global `fetch` | Custom transport |
-| `onHandlerError` | `(error) => void` | `console.error` | Fallback when a callback throws |
+Only `url` is required. Everything else is grouped by what it affects, and the
+defaults are the operating point the client was designed around.
 
-Lifecycle hooks can be passed as options (`onOpen`, `onMessage`, `onStatus`, `onError`,
-`onClose`, `onOverflow`, `onSuspectGap`, `onResume`) or subscribed later; both forms are
-equivalent.
+| Group | Field | Type | Default | What it does |
+| --- | --- | --- | --- | --- |
+| — | `url` | `string` | — | Request URL, including your gateway prefix |
+| `request` | `method` | `"GET" \| "POST"` | `"POST"` | HTTP method |
+| `request` | `body` | `unknown \| (() => unknown)` | — | Serialized as JSON; strings, `Blob` and `FormData` are sent as-is. A function is re-evaluated before every (re)connect, so filters can follow reactive state. Keep it pure: `deriveShareKey` resolves it too |
+| `request` | `headers` | `HeadersInit \| () => HeadersInit \| Promise<HeadersInit>` | — | Pass a function to recompute headers on every (re)connect |
+| `request` | `credentials` | `RequestCredentials` | `"same-origin"` | Use `"include"` when the SSE endpoint is on another origin and auth rides on cookies |
+| `request` | `fetch` | `FetchLike` | global `fetch` | Custom transport |
+| — | `parse` | `(raw: string) => unknown` | identity | Payload decoder; `jsonParse` from the package keeps the raw text when a frame is not JSON |
+| `resume` | `from` | `string` | — | Resume point for the first request, sent as `Last-Event-ID`; use it to continue where a previous page load stopped |
+| `resume` | `persist` | `string \| boolean` | — | Keep `lastEventId` in storage across reloads. `true` derives the key from the subscription; writes are throttled to 1/s and flushed on close and `pagehide` |
+| `resume` | `storage` | `ResumeStorage \| null` | `sessionStorage` | Where `persist` reads and writes; `null` disables it (SSR, sandboxed iframes) |
+| `retry` | *(function)* | `(ctx) => number \| false \| Promise<number \| false>` | — | Custom policy: it owns the delay, so the knobs below are ignored |
+| `retry` | `max` | `number` | `Infinity` | Retry limit |
+| `retry` | `baseDelay` | `number` | `1000` | Delay before the first retry (ms) |
+| `retry` | `maxDelay` | `number` | `30000` | Upper bound for backoff (ms) |
+| `retry` | `stableAfter` | `number` | `10000` | An attempt that lived this long resets the retry counter |
+| `stream` | `idleTimeout` | `number` | `0` | Reconnect when no bytes arrive for this long. Set it to ~3× the heartbeat interval |
+| `stream` | `rotate` | `number \| { interval, mode?, timeout? }` | `0` | Reconnect on a schedule. A number is shorthand for `{ interval }`; `mode` is `"restart"` (default) or `"overlap"` (pre-opened replacement, no gap); `timeout` defaults to `30000` |
+| `stream` | `pauseWhenHidden` | `boolean` | `false` | Suspend while the page is hidden, reconnect when visible |
+| `stream` | `endSignal` | `string` | — | Treat this `data` value as end-of-stream, e.g. `"[DONE]"` |
+| `stream` | `events` | `string[]` | — | Allow-list of event names |
+| `stream` | `reconnectOnEnd` | `boolean` | `true` | Reconnect when the server ends the stream normally |
+| `stream` | `strictContentType` | `boolean` | `true` | Require `content-type: text/event-stream` |
+| `limits` | `maxBufferSize` | `number` | `1MB` | Cap for a single message buffer (characters) |
+| `limits` | `overflowPolicy` | `"close" \| "drop"` | `"close"` | On overflow: disconnect with a terminal `protocol` error, or drop that message and keep streaming — `dropped` counts it and `hooks.gap` reports `reason: "drop"` |
+| `limits` | `yieldEvery` | `number` | `0` | Parse at most this many events per task, then yield; `0` keeps a whole chunk in one task |
+| `hooks` | `open` `message` `status` `error` `close` `gap` `resume` `handlerError` | callbacks | `console.error` for `handlerError` | Observers; each is equivalent to the matching `onXxx()` method |
+| — | `autoStart` | `boolean` | `true` | Connect in the constructor |
 
+`hooks` is the declarative spelling of the lifecycle subscriptions: `hooks.status`
+and `client.onStatus(...)` see the same events, so pick one per concern. Act on
+`hooks.gap` (`{ reason, lastId, attempt }`); log `hooks.resume`
+(`{ lastId, firstId, skipped, continuous }`).
+
+A grouped field wins over the deprecated flat spelling (`body`, `idleTimeout`,
+`onStatus`, …), which is still accepted for one minor version. Two former
+options are gone rather than deprecated: `flags` (append the query string
+yourself) and `onOverflow` (watch `dropped`, or `hooks.gap` with
+`reason: "drop"`).
 #### Properties
 
 | Property | Type | Description |
@@ -210,7 +335,7 @@ equivalent.
 | `closed` | `boolean` | Terminal state; the client will not reconnect |
 | `attempts` | `number` | Consecutive retries; resets after a stable connection |
 | `lastEventId` | `string` | Latest event id, sent back on reconnect |
-| `url` | `string` | The URL actually requested, `flags` already applied |
+| `url` | `string` | The URL requested |
 | `dropped` | `number` | Messages discarded by the cap (only grows with `overflowPolicy: "drop"`) |
 | `done` | `Promise<void>` | Resolves when the connection terminates; never rejects |
 
@@ -225,7 +350,7 @@ equivalent.
 | `on(event, handler)` | Subscribe to one event name; returns an unsubscribe function |
 | `on("*", handler)` | Subscribe to every message |
 | `once(event, handler)` | Subscribe for a single delivery |
-| `onMessage` / `onStatus` / `onError` / `onOpen` / `onClose` / `onOverflow` / `onSuspectGap` / `onResume` | Lifecycle subscriptions |
+| `onMessage` / `onStatus` / `onError` / `onOpen` / `onClose` / `onSuspectGap` / `onResume` | Lifecycle subscriptions (the imperative form of `hooks`) |
 | `fanout()` | One `"*"` subscription, many consumers, plus a latest-value snapshot per event (memoised) |
 | `use(plugin)` | Attach a plugin; a returned function runs once on close |
 
@@ -235,25 +360,21 @@ equivalent.
 ### `useSharedSSEClient(config?)`
 
 `acquireSSEClient` covers "one subscription, many consumers". This covers the harder half:
-**the subscription itself changes** (floor, tenant, filter, time range) while the consumer
-stays mounted.
-
-The handle you get back is not a connection. It owns *your subscription description and
-your listeners*; the connection belongs to a key and is shared with everybody on that key.
+the subscription itself changes while the consumer stays mounted. The handle owns your
+subscription description and your listeners; the connection belongs to a key.
 
 ```ts
 const sse = useSharedSSEClient({ grace: 5_000 });
 
-sse.on("IOT", apply);                              // buffered: nothing connects yet
-sse.configure({ url, body: [{ floorId: "F1" }] }); // open or reuse the matching connection
-watch(floorId, (id) => sse.configure({ url, body: [{ floorId: id }] }));
+sse.on("POINT", apply);                            // buffered: nothing connects yet
+sse.configure({ url, request: { body: { tenantId: "acme" } } }); // open or reuse the matching one
+watch(tenantId, (id) => sse.configure({ url, request: { body: { tenantId: id } } }));
 onScopeDispose(() => sse.release());
 ```
 
-`configure` does four things: derive the key, return early when it is unchanged, detach
-your listeners from the old client, attach them to the matching one (reusing it when a peer
-already holds it), and finally decrement the old key's reference count. That last step is
-why switching floors does not disturb a second component still watching the previous one.
+`configure` derives the key, returns early when it is unchanged, moves your listeners to the
+matching client (reusing it when a peer already holds it), then decrements the previous key's
+reference count — which is why a switch does not disturb a peer still on the old key.
 
 | Call | Effect |
 | --- | --- |
@@ -271,14 +392,8 @@ Continuity signals belong to the handle for the same reason: `onSuspectGap` and 
 are re-attached on every switch, while a listener bound to a cached `client` goes silent
 the moment the subscription moves.
 
-Four things that surprise people:
+Two things specific to this handle:
 
-- **Same body, different `parse` collapse into one connection.** The key only covers
-  `url` / `method` / `body` / `events` / `flags`, and the *first* caller's `parse` wins —
-  the second consumer receives whatever it returns. Pass `keyOf` to separate them.
-- **Switching is not grace-protected.** `F1 → F2 → F1` is two reconnects. Debounce the
-  switch, or bucket the filter into the key (round the time range to a minute) instead of
-  letting a slider produce a new key per pixel.
 - **`grace` only applies to `close()`.** It exists for remounts (route changes), not for
   subscription changes.
 - **`useSSE({ shared: true })` is the fixed-subscription flavour** and does not expose
@@ -287,13 +402,14 @@ Four things that surprise people:
 `config`: `grace` (ms an unreferenced connection stays open, default 0), `keyOf` (defaults
 to `deriveShareKey`), `create` (client factory, defaults to `new SSEClient`).
 
-Reach for `acquireSSEClient` instead when the subscription never changes — it needs no
-listener bookkeeping. Use a plain `SSEClient` for a single consumer, and
-`createMultiTabSSE` when the duplication is across tabs rather than components.
+The decision table in [Choosing a client](#choosing-a-client) covers when this handle is the
+right tool: `acquireSSEClient` when the subscription never changes (`useSharedSSEClient`
+needs listener bookkeeping you would not use), and `createMultiTabSSE` when the duplication
+is across tabs rather than components.
 
 ### `deriveShareKey(options)`
 
-Stable key from `url`, `method`, `body`, `events` and `flags`; object keys are sorted and
+Stable key from `url`, `method`, `body` and `events`; object keys are sorted and
 arrays are compared as sets. A `body` factory is resolved first, so changed filters mean a
 different key. Exposed so an explicit `key` can follow the same rules.
 
@@ -345,369 +461,31 @@ An `http` error carries `retryAfter` (ms) when the response had a `Retry-After`
 header, and the built-in backoff uses it — clamped between 200ms and `retryMaxDelay`
 — instead of the exponential curve. A custom `retry` policy can read the same field.
 
-## Recipes
+## Continuity in one page
 
-### Refresh the token on 401
+Four signals, four different jobs. Most misuse of this library comes from wiring one of
+them to a question it cannot answer.
 
-A retry policy may be async, so the refresh can complete before the next attempt:
-
-```ts
-let refreshed = false;
-
-const client = new SSEClient({
-  url,
-  retry: async ({ error, attempt }) => {
-    if (error?.status === 401 && !refreshed) {
-      await refreshToken();
-      refreshed = true;
-      return 0; // retry immediately
-    }
-    return attempt > 5 ? false : Math.min(30_000, 1000 * 2 ** attempt);
-  },
-});
-```
-
-### Resume across a reload
-
-`lastEventId` lives in memory, so an F5 restarts the stream at "now" and silently skips
-whatever the server produced while the page was loading. Persist the point instead:
-
-```ts
-new SSEClient({
-  url,
-  persistKey: "alarm",   // sessionStorage under this key
-  // persistKey: true    // key derived from url/method/body
-});
-```
-
-The stored point is read before the first request. While streaming, writes are coalesced to
-one per second and flushed on close, on suspend and on `pagehide`, so a fast stream does not
-turn into one synchronous storage write per message. Use `resumeFrom` when the point comes
-from somewhere else (a snapshot API, the URL, another tab).
-
-### Resync after a gap
-
-The client cannot know what a reconnect skipped — only that it cannot prove continuity.
-`onSuspectGap` turns that into an actionable event:
-
-```ts
-const client = new SSEClient({
-  url,
-  persistKey: "iot",
-  onSuspectGap: async ({ reason, lastId }) => {
-    const snapshot = await fetchSnapshot(); // { id: "9042", data: [...] }
-    store.replaceAll(snapshot.data);
-    client.setResumePoint(snapshot.id);      // the next connection continues from here
-  },
-});
-```
-
-Reasons are `reconnect`, `resume` (hidden page or offline), `rotate` (`restart` mode only),
-`drop` (a message exceeded `maxBufferSize`) and `promote` (a multi-tab follower took over
-from a leader that went away). It fires once per episode, so a ten-minute outage does not
-trigger twenty snapshot requests. `setResumePoint` never interrupts the running stream:
-rewriting `Last-Event-ID` mid-stream would desynchronise the parser instead of healing the
-gap.
-
-### Did the resume actually resume?
-
-`onSuspectGap` says "I cannot prove continuity". `onResume` answers the question it leaves
-open, once the first event of the new connection arrives:
-
-```ts
-const client = new SSEClient({
-  url,
-  onResume: ({ firstId, skipped, continuous }) => {
-    if (continuous === false) {
-      metrics.increment("sse.resume.skipped", { skipped });
-    }
-    cursor.moveTo(firstId);
-  },
-});
-```
-
-`skipped` is `firstId - lastId` when both ids are integers: `0` means the server replayed
-the last event, `> 1` means events are missing. Both `skipped` and `continuous` stay
-`undefined` for opaque ids — a client that invented an ordering would report a confident
-lie, so it reports nothing instead. Use it for observability, and keep `onSuspectGap` as
-the hook that triggers a snapshot refetch.
-
-### Share one connection
-
-HTTP/1.1 allows six connections per origin, and a push channel holds one open indefinitely.
-Share it instead of opening one per component:
-
-```ts
-import { acquireSSEClient } from "@songfreedom/sse-client";
-
-const { client, release } = acquireSSEClient("alarm", () => new SSEClient({ url, body }));
-onScopeDispose(release); // closes when the last consumer releases
-```
-
-### Share a subscription that changes
-
-A floor switcher where three components watch the same stream and the floor can change at
-runtime:
-
-```vue
-<script setup lang="ts">
-const props = defineProps<{ floorId: string }>();
-
-const sse = useSharedSSEClient({ grace: 5_000 });
-sse.on("IOT", (point) => dock.apply(point)); // buffered until a connection exists
-
-watch(
-  () => props.floorId,
-  (floorId) => sse.configure({ url, body: [{ floorId }] }),
-  { immediate: true },
-);
-
-onUnmounted(() => sse.release());            // refcount, not a hard close
-</script>
-```
-
-All three components land on one connection because the key is derived from the
-subscription itself (`url`, `method`, `body`, `events`, `flags`; arrays compared as sets) —
-they never have to agree on a string. Switching the floor moves all of them together and
-closes the old connection only once the last one has moved off it.
-
-The behaviour table, `close()` versus `release()`, and the traps (a shared `parse`, no
-grace when switching) live in [`useSharedSSEClient`](#usesharedsseclientconfig).
-
-### One connection for every tab
-
-Six dashboard tabs are six connections to the same stream. With Web Locks and
-`BroadcastChannel` the tabs elect one leader and the rest replay what the leader relays:
-
-```ts
-import { createMultiTabSSE } from "@songfreedom/sse-client/multi-tab";
-
-const sse = createMultiTabSSE({ url: "/api/push", body: { topics: ["iot"] } });
-sse.on("IOT", (point) => store.apply(point)); // every tab, one connection
-sse.role;                                     // "leader" | "follower" | "solo"
-```
-
-When the leader tab closes, a queued follower takes the lock and resumes from the last id
-it saw, so the handover costs one `Last-Event-ID` gap instead of a full resubscribe.
-Continuity signals cross the relay as well: the taking-over tab reports
-`onSuspectGap({ reason: "promote" })`, and `onResume` is relayed from whichever tab owns
-the connection.
-Without Web Locks or `BroadcastChannel` every tab reports `solo` and connects on its own —
-a degraded but honest fallback, rather than a hand-rolled protocol that can split-brain.
-`parse` must return structured-cloneable data, and `onOpen` fires on the leader only,
-because a `Response` cannot be relayed.
-
-### Fan-out: many consumers, one connection
-
-`on("*")` works, but every consumer then pays for its own wildcard handler and
-nobody remembers the last payload. `fanout()` gives one subscription and a
-snapshot per event, so a component that mounts late can render immediately:
-
-```ts
-const feed = client.fanout();
-
-feed.on("IOT_DATA_CHANGE", applyPoint);   // each consumer has its own unsubscribe
-feed.on("ABNORMAL_EVENT", pushAlarm);
-
-feed.latest("IOT_DATA_CHANGE");           // most recent payload, or undefined
-feed.count("IOT_DATA_CHANGE");            // how many consumers are listening
-```
-
-A throwing consumer is reported through `onHandlerError` and does not affect the
-others. `dispose()` drops every consumer and the source subscription; the
-snapshot stays readable until then.
-
-### Testing without a server
-
-The client only needs `fetch`, so the package ships a fake one. Reconnects,
-resume, hung gateways and rotation can all be reproduced in-process:
-
-```ts
-import { SSEClient } from "@songfreedom/sse-client";
-import { createMockSSEFetch } from "@songfreedom/sse-client/testing";
-
-const mock = createMockSSEFetch({
-  script: attempt =>
-    attempt === 0
-      ? [{ id: "1", event: "ALARM", data: { level: "high" } }]
-      : [{ id: "2", event: "ALARM", data: { level: "low" } }],
-});
-
-const client = new SSEClient({
-  url: "/push",
-  body: { topics: ["alarm"] },
-  fetch: mock.fetch,
-  parse: JSON.parse,
-  maxRetry: 1,          // one reconnect after the script ends, so `done` settles
-  retryBaseDelay: 0,
-});
-client.on("ALARM", handler);
-await client.done;
-
-expect(mock.calls[1].headers.get("last-event-id")).toBe("1");
-expect(mock.lastBody()).toEqual({ topics: ["alarm"] });
-```
-
-`keepOpen` models a live subscription, `hang` models a stalled gateway, and
-`script` receives the attempt index so a reconnect can return different data.
-
-### Large lists and charts: compose the view window
-
-The client stops at "message dispatched". What a view keeps, and how often it repaints,
-belongs to the app — two building blocks cover most dashboards:
-
-```ts
-import { shallowRef, onUnmounted } from "vue";
-import { createRingBuffer, useSSE, jsonParse } from "@songfreedom/sse-client";
-
-const ring = createRingBuffer<Point>({ capacity: 2_000 }); // memory bound
-const rows = shallowRef<Point[]>([]);
-let frame = 0;
-
-const schedule = () => {
-  if (frame) return;
-  frame = requestAnimationFrame(() => {
-    frame = 0;
-    rows.value = ring.toArray(); // one array per frame, not per message
-  });
-};
-
-const { dispose } = useSSE({
-  url: "/api/push",
-  parse: jsonParse,
-  onMessage: (message) => {
-    ring.push(message.data as Point);
-    schedule();
-  },
-});
-
-onUnmounted(dispose);
-```
-
-Capacity and publish volume are the same number here on purpose: `toArray()` costs
-O(capacity) per frame, so a buffer that is cheap to keep is also cheap to publish. When
-those two pull apart (keep 6000 points, render 500), publish a slice or virtualize the
-list — do not raise the capacity and hope.
-
-`ring.evicted` counts what was overwritten, so the UI can be honest instead of
-pretending the list is complete:
-
-```ts
-const truncated = computed(() => ring.evicted > 0); // "last 2000 points"
-```
-
-Size with `capacity = seconds × rate`. If the number keeps growing, the view is the wrong
-home for that data: downsample on the server (1s/1min aggregates) or page it from a query
-endpoint. Never compress an event list client-side — sampling a list of alarms silently
-deletes alarms, and nothing on screen says so.
-
-### Batch high-frequency updates
-
-When the same entity is pushed every few hundred milliseconds, coalesce before writing to state:
-
-```ts
-import { createBatcher } from "@songfreedom/sse-client";
-
-const batcher = createBatcher<string, Point>({
-  key: (point) => `${point.objectId}::${point.code}`,
-  interval: 300,
-  maxPending: 2000, // at most 2000 entities per window
-  onFlush: (points) => store.applyPoints(points),
-});
-
-client.on("IOT", (payload) => payload.data.forEach((p) => batcher.push(p)));
-```
-
-`maxPending` is unlimited by default; when it is reached the entry that has not been updated for the
-longest time is evicted, and the count shows up in `batcher.dropped`. After `dispose()`, `push()`
-becomes a no-op (also counted), so a late callback cannot restart the timer.
-
-Pass `leading: true` for a sparse stream: the first value of an idle window is delivered
-immediately — a panel that updates once a minute is no longer shown one interval late —
-while the burst behind it is still coalesced into the trailing flush.
-
-Two things matter when a shared connection feeds several consumers: `batcher.subscribe(fn)` adds
-listeners next to `onFlush`, so the window is written to state once and every consumer is notified
-from the same batch; `chunkSize` hands a large window over in slices, yielding between them, so
-5000 entities do not become one long task.
-
-### High frequency and large payloads: does memory grow?
-
-Not without bound, as long as the three caps are in place:
-
-1. **Network.** The read loop is pull-based (`await reader.read()`): a slow handler stops the
-   next read, the browser stops draining the socket, and the exhausted TCP window blocks the
-   server's `write()`. Backpressure propagates upstream without any extra flow-control protocol.
-2. **Parser.** The line `buffer` and the accumulated `data` lines of one event are both capped by
-   `maxBufferSize` (1MB by default); exceeding it raises a `protocol` error and disconnects by
-   default — the `huge` and `no-blank-line` demo scenarios exercise that path. If losing a message
-   is acceptable but disconnecting is not, use `overflowPolicy: "drop"`: only that message is
-   discarded (counted in `dropped`, reported through `onOverflow`), the connection stays open and
-   the parser resynchronises on the next blank line.
-3. **Application.** The client keeps no history: a message is collectable as soon as it is
-   dispatched. Growth only comes from what your code retains — arrays, reactive stores, log tables.
-
-Measured (the demo's `flood` scenario via `pnpm demo:memory`, one Chrome tab): **368 MB** and
-48,000 events in 30 seconds, 4.6 MB peak heap, 0.8 MB after a forced GC (0.6 MB baseline), DOM
-nodes 117 → 117. The saw-tooth is unreclaimed garbage, not a leak. Details and the reproduction
-script are in [`demo/README.md`](./demo/README.md#6-high-frequency--memory-measurement).
-
-Two things remain yours to handle: do not accumulate messages in the handler, and lower
-`maxBufferSize` if every message is large and you want anomalies to surface sooner.
-
-### Long tasks: yielding the main thread
-
-`feed()` is synchronous: a chunk carrying N events parses and dispatches all N in the same task.
-Parsing itself is cheap (measured at roughly 3–10µs per event); what actually blocks the page is
-**your handler** — 1ms of rendering per message times 1500 messages in one chunk is a 1.4s stall.
-`yieldEvery` slices between parse and dispatch:
-
-```ts
-new SSEClient({ url, yieldEvery: 20 }); // parse 20 events, yield, continue
-```
-
-Yielding uses `scheduler.yield()` when available and falls back to `setTimeout(0)`; an abort during
-the pause behaves exactly like an abort inside `reader.read()`.
-
-Measured in the demo (`pnpm demo:memory --handler=1`, 1ms simulated work per message, 2000 events
-in one chunk):
-
-| `yieldEvery` | Longest single block | Total main-thread time | Events |
+| Signal | Fires when | What you learn | What to do with it |
 | --- | --- | --- | --- |
-| `0` | **1467 ms** | 2032 ms | 2000 |
-| `20` | **117 ms** | 2046 ms | 2000 |
+| `lastEventId` (property) | after any event that carried an `id:` | the point the **next** connection will ask for | nothing — it is the bookkeeping the rest builds on |
+| `hooks.gap` (`onSuspectGap`) — `{ reason, lastId, attempt }` | once per episode, when continuity **cannot be proven**: `reconnect` (an attempt ended), `resume` (page or network came back), `rotate` (`restart` mode only), `drop` (a message exceeded `maxBufferSize`), `promote` (a tab took over) | only that something *may* be missing — never what | refetch a snapshot, then `setResumePoint(snapshot.id)` |
+| `hooks.resume` (`onResume`) — `{ lastId, firstId, skipped, continuous }` | on the first event with an id, after a request that carried `Last-Event-ID` | whether the server continued, and how far it jumped; both `skipped` and `continuous` are `undefined` when ids are opaque | metrics and logs; `continuous === false` means a real hole |
+| `setResumePoint(id)` | you call it | which point the next connection asks for | right after healing a gap, with the snapshot id |
 
-The total work is identical (slicing does not save time) but the longest block drops by 12x. Note
-that the residual ~117ms is not a slice-size artefact — `yieldEvery: 5` measures the same 117ms:
-two seconds of backlog keeps rendering starved, so slicing only guarantees "no single runaway task".
-To stop the jank entirely, reduce the per-message cost or coalesce (see `createBatcher` above).
+Two rules keep them apart:
 
-### Rotation vs reconnect
+- **`hooks.gap` decides what to do; `hooks.resume` decides what to report.** Do not trigger
+  the snapshot refetch from `continuous === false`: that report arrives on the first event
+  of the recovered stream, so you would paint new data and then overwrite it.
+- **Never rewrite the resume point of the live stream.** `setResumePoint` applies to the
+  *next* connection by design; changing `Last-Event-ID` mid-stream desynchronises the
+  parser instead of healing the gap.
 
-A connection can stay alive while the server-side subscription is already gone. Rotation
-reconnects on a schedule (`rotateInterval`) to avoid such zombie connections, keeping
-`lastEventId` so nothing is missed:
-
-```ts
-new SSEClient({ url, rotateInterval: 30 * 60_000 });
-```
-
-This relies on the server honouring `Last-Event-ID`. When it does not — or when a gap is
-unacceptable — rotate without a gap instead:
-
-```ts
-new SSEClient({ url, rotateInterval: 30 * 60_000, rotateMode: "overlap", rotateTimeout: 30_000 });
-```
-
-`overlap` requests the replacement *while the current connection keeps streaming*, and takes
-it over only once it is accepted: the old attempt is aborted, the candidate is read from the
-buffer it already filled, so no event is lost and none is replayed. A candidate that cannot
-be opened (502, wrong content-type, timeout) is dropped and reported through `onError`, while
-the running connection stays untouched — a scheduled rotation never trades a working stream
-for a broken one.
-
-`restart` (the default) closes first and reopens, which is cheaper on the server and safe
-when `Last-Event-ID` is supported.
+If the server sends no `id:`, the resume story does not exist: there is nothing to ask the
+server to continue from, so neither `hooks.gap` (except for `drop`, which is local data
+loss) nor `hooks.resume` will fire. Treat a silently lossy stream as a server-contract problem,
+not something the client can paper over.
 
 ## Low-level building blocks
 
@@ -752,8 +530,8 @@ server and use the buffer for what the chart displays.
 
 ## Design notes
 
-- No business logic: the client does not know about tokens, stores, toasts or routing.
-  Authentication is injected through `headers`.
+- No business logic: authentication goes through `headers`; tokens, stores and routing stay
+  out of the client.
 - Errors never escape as exceptions from callbacks; a throwing handler is isolated and
   reported through `onHandlerError` while the stream keeps flowing.
 - Timers are always cleared on close, and the connection loop only exits when the client is
@@ -772,17 +550,9 @@ pnpm build        # dist/ + dist/package.json
 
 Integration demo (real browser + real Nginx, plus a headless smoke run):
 see [demo/README.md](./demo/README.md) — `pnpm demo:server` / `pnpm demo:smoke` /
-`pnpm demo:matrix` / `pnpm demo:memory`.
+`pnpm demo:matrix` / `pnpm demo:consumers` / `pnpm demo:memory`.
 
-CI runs the whole pipeline on Node 18, 20 and 22; coverage thresholds and the headless
-demo smoke run once, on Node 20.
-
-Releasing: add the CHANGELOG entry, bump the version, tag the commit, then
-
-```bash
-git tag -a v0.1.4 -m "v0.1.4"
-pnpm publish:npm  # build + publish to npmjs (access: public)
-```
+CI lives in `.github/workflows/ci.yml`.
 
 ## License
 

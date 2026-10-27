@@ -621,20 +621,22 @@ describe("SSEClient protocol robustness", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const received: string[] = [];
-    const onOverflow = vi.fn();
+    const gaps: string[] = [];
     const onError = vi.fn();
     const client = new SSEClient({
       url: "/s",
-      maxBufferSize: 1024,
-      overflowPolicy: "drop",
-      onOverflow,
-      onError,
-      onMessage: (message) => received.push(message.raw),
+      limits: { maxBufferSize: 1024, overflowPolicy: "drop" },
+      hooks: {
+        gap: (info) => gaps.push(info.reason),
+        error: onError,
+        message: (message) => received.push(message.raw),
+      },
     });
 
     await vi.waitFor(() => expect(received).toEqual(["ok"]));
     expect(client.dropped).toBe(1);
-    expect(onOverflow).toHaveBeenCalledWith(1);
+    // The count is the metric; the loss itself is the gap signal.
+    expect(gaps).toEqual(["drop"]);
     expect(onError).not.toHaveBeenCalled();
     expect(client.status).toBe("open");
     expect(fetchMock).toHaveBeenCalledTimes(1);

@@ -9,10 +9,26 @@
 | `server.mjs` | 零依赖 SSE 服务端（`127.0.0.1:8787`）：Bearer 鉴权、`Last-Event-ID` 续传、16 个故障 / 边界 / 压力场景 |
 | `index.html` + `main.js` | 浏览器联调台：入口切换、场景切换，所有客户端开关都摆在界面上；带内存采样面板，支持中英切换 |
 | `smoke.mjs` | 无浏览器冒烟：直连 / 网关 / 续传一条命令搞定，可进 CI |
-| `browser-matrix.mjs` | 真实 Chrome / Edge 自动化：基于 CDP 跑 11 个场景，不依赖 Playwright |
+| `browser-matrix.mjs` | 真实 Chrome / Edge 自动化：基于 CDP 跑 20 个场景，不依赖 Playwright |
 | `memory-probe.mjs` | 内存压测：flood 灌流 + CDP 堆采样 + GC 归零对比，回答「长连接会不会涨内存」 |
+| `consumers-check.mjs` | 驱动四个消费示例页：角色分配与接管、F5 续传、401 自愈、切租户换 key |
 | `nginx.conf` | 本机 Nginx：8081 正确，8082 故意配错 |
 | `nginx.docker.conf` | Docker 版，仅 upstream 地址不同 |
+| `consumers/` | 消费侧示例：告警中心 / 测点看板 / 多标签页 / Vue 共享订阅，按业务层消费方式组织；每页都有可编辑配置面板 |
+
+## 按业务场景索引
+
+不同业务场景各跑哪些 demo（场景参数与预期见 [§ 3 场景与预期](#3-场景与预期)）：
+
+| 业务场景 | 用这里的什么 | 怎么跑 |
+| --- | --- | --- |
+| 告警中心 / 不能丢事件 | `smoke.mjs`：`Last-Event-ID: 5` 续传断言（从 id=6 恢复） | `pnpm demo:smoke` |
+| 设备测点大数据 / 高频采集 | `memory-probe.mjs`：flood 灌流 + burst 单块 + GC 归零对比（§ 6） | `pnpm demo:memory` |
+| 实时大屏 / 多标签页 / 后台 | browser-matrix：后台挂起→恢复、隐藏中构造（§ 5.1） | `pnpm demo:matrix` |
+| 移动端 / 弱网巡检 | browser-matrix：断网 0.8s 恢复、`silent` + `idleTimeout`（§ 5.1） | `pnpm demo:matrix` |
+| 网关与链路验收 | 8081 正确 / 8082 配错对照、`accel` 上游自救（§ 2、§ 4） | `pnpm demo:smoke` |
+| 渲染卡顿 / 长任务 | `yieldEvery` A/B +「处理耗时」忙等模拟（§ 6.1） | `pnpm demo:memory --handler=1 --yield=20` |
+| 鉴权过期自愈 | 联调台「401 自动刷新 token」× `error401` 场景（§ 3） | `pnpm demo:server` 后手动操作 |
 
 ## 1. 启动服务端
 
@@ -136,9 +152,12 @@ curl -N -X POST "http://localhost:8082/subscribe?scenario=normal&interval=500" \
 ```bash
 pnpm build && pnpm demo:server          # 终端 1
 docker run ...                          # 终端 2，见第 2 节
-pnpm demo:matrix                        # Chrome + Edge，各 11 个场景
+pnpm demo:matrix                        # Chrome + Edge，各 20 个场景
 pnpm demo:matrix --only=edge            # 只跑一个浏览器
 node demo/browser-matrix.mjs --shots=D:\shots   # 指定截图目录（默认 %TEMP%\sse-matrix）
+
+pnpm demo:consumers                     # 四个消费示例页，各 12 条断言
+pnpm demo:consumers --only=edge
 ```
 
 用 CDP + Node 内置 WebSocket 直接驱动真实浏览器，不依赖 Playwright：
@@ -156,8 +175,21 @@ node demo/browser-matrix.mjs --shots=D:\shots   # 指定截图目录（默认 %T
 | 断网 0.8s 恢复 | 回到 `open`，无 `close error`，事件继续增长 |
 | 后台挂起后恢复 | 隐藏时 `idle` 且无新增，恢复后 `open` 并继续收流 |
 | 隐藏页构造后激活 | 激活前 0 条 / `idle`，激活后开始收流（P0 回归） |
+| 心跳注释 + idleTimeout | 0 条（注释不是事件）、`heartbeat` 错误、至少 1 次重试 |
+| `retry:` 字段 | 重连后 ≥2 条，无 `protocol` 错误 |
+| 未终止事件触顶 | `protocol` 错误、`closed`（4KB 行一直不写空行） |
+| 慢握手 | 2 秒时仍 `connecting`、0 条 |
+| 200 + text/html | `protocol` 错误、`closed`、只尝试 1 次 |
+| 500 退避后耗尽 | 至少 2 次尝试后 `closed` |
+| 401 终止 | 只尝试 1 次即 `closed` |
+| accel 的 `X-Accel-Buffering` | ≥4 条、`open`（该响应头在 :8082 上的效果留给手动演示） |
 
-最近一次结果：Chrome 155.0.8059.85 / Edge 155.0.4283.62，**22/22 PASS**，重复跑稳定。
+`consumers-check.mjs` 断言的是每个示例页存在的理由：leader/follower 分工与 leader
+关闭后的接管、切租户换共享 key、压力下环形缓冲持续填充、F5 续传（`skipped=1`，
+即干净衔接）、以及吊销令牌后经 401 重试自愈。
+
+最近一次结果：Chrome 155.0.8059.85 / Edge 155.0.4283.62，矩阵 **40/40 PASS**，
+消费示例 **20/20 PASS**，重复跑稳定。
 
 已知限制：
 
@@ -234,7 +266,8 @@ pnpm demo:memory --seconds=12 --interval=50 --burst=25 --size=512 --handler=1 --
 `yieldEvery: 5` 也是 117ms——2 秒的总积压会持续压住渲染，切片只能保证没有单次超长任务。
 
 `overflowPolicy` 同样在界面上（勾选框「超限消息丢弃、不断开」）。勾上后跑 `huge`：连接保持 `open`，
-只丢那一条，日志出现 `overflow` 行和累计丢弃数；不勾则是原来的 `protocol` 错误 + `closed`。
+只丢那一条，日志出现 `gap` 行（`reason: drop`）——丢消息是连续性问题而不是传输失败，所以走 gap 信号，
+累计条数看 `client.dropped`；不勾则是原来的 `protocol` 错误 + `closed`。
 
 ## 注意
 

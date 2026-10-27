@@ -14,24 +14,58 @@ All notable changes to this project are documented here. The format follows
   once; a returned function runs on close.
 - `body` accepts a factory, re-evaluated before every (re)connect, so a subscription can
   follow reactive filters without rebuilding the client.
-- `credentials` (defaults to `"same-origin"`) and `flags` (valueless query flags such as
-  `["GRID_MAP"]`, appended without disturbing an existing query string or hash).
+- `credentials` (defaults to `"same-origin"`).
 - Readiness gate `when` for `useSSE` / `useSharedSSE`: no request is issued while it
   returns false, and the connection is released when it shuts.
 - `@songfreedom/sse-client/testing`: `createMockSSEFetch` drives reconnects, resume, hung
   gateways and rotation in-process, without a server or a test runner dependency.
+- `demo/consumers-check.mjs` (`pnpm demo:consumers`): drives the four consumer examples in a
+  real browser — leader/follower split and takeover, F5 resume, 401 self-heal, tenant switch,
+  ring buffer under pressure, and a config edit landing as a rebuild / new share key. These
+  pages had no automated coverage before.
+- The consumer example pages can be driven from the browser: a shared config panel
+  (`demo/consumers/shared/panel.js`) exposes scenario, interval, `idleTimeout`,
+  `yieldEvery` and friends, applies edits after 300ms by rebuilding the connection, and
+  keeps the values in `sessionStorage`.
+- `demo/browser-matrix.mjs` now covers every fault scenario in `demo/server.mjs`: 11 → 20
+  cases, adding heartbeat + `idleTimeout`, the `retry:` field, an unterminated event hitting
+  the buffer cap, slow headers, `200 + text/html`, `500` backoff exhaustion, terminal `401`
+  and the `accel` upstream escape hatch.
 
 ### Changed
 
-- `deriveShareKey` folds `flags` into the key and resolves a `body` factory, so two flag
-  sets or two filter values never share a connection by accident.
+- `deriveShareKey` resolves a `body` factory, so two filter values never share a connection
+  by accident.
 - A plugin that throws is reported through `onHandlerError` like any other callback;
   `console.error` remains the fallback when no handler is configured.
 - `useSSE({ when })` reports `idle` while the gate is shut instead of `closed`, matching
   the shared flavour — a pause is not the end of the stream.
+- Options are grouped by what they affect — `request`, `resume`, `retry`, `stream`,
+  `limits`, `hooks` — instead of 38 top-level fields. The flat spelling still works
+  (deprecated, one minor version) and a grouped value wins when both are set, so adoption
+  can be incremental per call site.
+- `createMultiTabSSE` is only importable from `./multi-tab`. Re-exporting it from `.` put
+  the election and relay code in every bundle, including the ones that never share across
+  tabs.
+- The shared-registry helpers (`getSharedSSEClients`, `getSharedSSEClientCount`,
+  `closeAllSharedSSEClients`) moved from `.` to `./testing`: they exist for tests and
+  teardown, not for application code.
+- Documentation is organised by decision instead of by API: a selection table for every way in
+  (with what each one costs), a one-page continuity model that separates
+  `hooks.gap` from `hooks.resume`, and a "use when / not for" line on every recipe.
+
+### Removed
+
+- `flags`: put the query string into `url` instead. It was only appended to the request
+  and folded into the share key, so nothing else changes.
+- `onOverflow` (the option, the method, and the same member on `useSharedSSEClient` and
+  `createMultiTabSSE`). A dropped message is a continuity problem: it is reported through
+  `hooks.gap` / `onSuspectGap` with `reason: "drop"`, and `dropped` keeps the count.
 
 ### Fixed
 
+- The browser matrix's `silent` case returned an interpolated string where a boolean was
+  expected, so it could never fail; it now asserts the `heartbeat` error and a retry.
 - The mock wrote a multi-line payload as one `data:` line, ending the field early and
   dropping the rest.
 - The mock lost custom headers when they were passed as a `Headers` instance or tuples,

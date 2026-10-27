@@ -1,6 +1,7 @@
 import { ref, shallowRef, watchEffect, type Ref, type ShallowRef } from "vue";
 import { SSEClient, type SSEClientOptions } from "./client.js";
 import type { SSEError } from "./errors.js";
+import { normalizeOptions } from "./options.js";
 import { useSharedSSEClient, type SharedSSEClientConfig } from "./share.js";
 import type { SSEEventMap, SSEMessage, SSEStatus, Unsubscribe } from "./types.js";
 
@@ -96,9 +97,12 @@ export function useSSE<E extends object = SSEEventMap>(
   options: UseSSEOptions,
 ): UseSSEReturn<E> {
   const { immediate = true, shared = false, when, ...clientOptions } = options;
+  // Flatten once here: the refs below are the only extra observers this
+  // composable adds, and they must not depend on which spelling the caller used.
+  const resolved = normalizeOptions(clientOptions);
 
   if (shared) {
-    return useSharedSSEImpl<E>(clientOptions, shared, immediate, when);
+    return useSharedSSEImpl<E>(resolved, shared, immediate, when);
   }
 
   const status = ref<SSEStatus>("idle");
@@ -120,20 +124,20 @@ export function useSSE<E extends object = SSEEventMap>(
   };
 
   const client = new SSEClient<E>({
-    ...clientOptions,
+    ...resolved,
     autoStart: false,
     onStatus: (next) => {
       status.value = next;
-      clientOptions.onStatus?.(next);
+      resolved.onStatus?.(next);
     },
     onError: (err, attempt) => {
       error.value = err;
-      clientOptions.onError?.(err, attempt);
+      resolved.onError?.(err, attempt);
     },
     onMessage: (message) => {
       // One object, O(1): the cheap half of "show me what just arrived".
       lastEvent.value = message;
-      clientOptions.onMessage?.(message);
+      resolved.onMessage?.(message);
     },
   });
 
@@ -215,8 +219,11 @@ function useSharedSSEImpl<E extends object>(
 ): UseSSEReturn<E> {
   const config: SharedSSEClientConfig = typeof shared === "object" ? shared : {};
   // `autoStart: false` keeps `immediate` in control and guarantees that the
-  // handle already holds a client when the caller receives one.
-  const connectOptions: SSEClientOptions = { ...options, autoStart: false };
+  // handle already holds a client when the caller receives one. The caller's
+  // hooks ride along as client options, which is why they are not chained again
+  // in the handle listeners below.
+  const resolved = normalizeOptions(options);
+  const connectOptions: SSEClientOptions = { ...resolved, autoStart: false };
 
   const status = ref<SSEStatus>("idle");
   const lastEvent = shallowRef<SSEMessage | null>(null);
@@ -231,15 +238,12 @@ function useSharedSSEImpl<E extends object>(
   // `handle.release()` removes them, so they need no bookkeeping here.
   handle.onStatus((next) => {
     status.value = next;
-    options.onStatus?.(next);
   });
-  handle.onError((err, attempt) => {
+  handle.onError((err) => {
     error.value = err;
-    options.onError?.(err, attempt);
   });
   handle.onMessage((message) => {
     lastEvent.value = message;
-    options.onMessage?.(message);
   });
 
   const syncClient = () => {
@@ -386,7 +390,7 @@ export interface UseSharedSSEReturn<E extends object = SSEEventMap> {
  * const floor = ref("F1");
  * const { status, lastEvent, dispose } = useSharedSSE({
  *   grace: 5_000,
- *   subscription: () => ({ url: "/api/push", body: [{ floorId: floor.value }] }),
+ *   subscription: () => ({ url: "/api/push", request: { body: [{ floorId: floor.value }] } }),
  * });
  * onUnmounted(dispose);
  * ```

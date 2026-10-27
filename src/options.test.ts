@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SSEClient } from "./client";
+import { normalizeOptions } from "./options";
 import { deriveShareKey } from "./share";
 
 const encoder = new TextEncoder();
@@ -63,20 +64,112 @@ describe("request options", () => {
     client.close();
   });
 
-  it("appends valueless query flags without disturbing the rest of the URL", async () => {
+  it("reads the same settings from the request group", async () => {
     const fetchMock = vi.fn((_url: string, init: RequestInit) => Promise.resolve(hangingResponse(init)));
     vi.stubGlobal("fetch", fetchMock);
 
-    const plain = new SSEClient({ url: "/push/subscribe", flags: ["GRID_MAP"] });
+    const client = new SSEClient({
+      url: "/s",
+      request: {
+        body: { topics: ["alarm"] },
+        credentials: "include",
+        headers: { "x-demo": "1" },
+      },
+    });
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    expect(plain.url).toBe("/push/subscribe?GRID_MAP");
-    expect(fetchMock.mock.calls[0][0]).toBe("/push/subscribe?GRID_MAP");
-    plain.close();
 
-    const withQuery = new SSEClient({ url: "/push?a=1#frag", flags: ["?GRID_MAP"] });
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    expect(withQuery.url).toBe("/push?a=1&GRID_MAP#frag");
-    withQuery.close();
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(init.credentials).toBe("include");
+    expect(init.body).toBe(JSON.stringify({ topics: ["alarm"] }));
+    expect(new Headers(init.headers as HeadersInit).get("x-demo")).toBe("1");
+    client.close();
+  });
+});
+
+describe("option groups", () => {
+  it("flattens every group into the single spelling the internals use", () => {
+    const body = () => [{ floorId: "F1" }];
+    const status = () => undefined;
+
+    const flat = normalizeOptions({
+      url: "/s",
+      request: { method: "GET", body, credentials: "include", headers: { a: "b" } },
+      parse: JSON.parse,
+      resume: { from: "7", persist: "alarm", storage: null },
+      retry: { max: 3, baseDelay: 250, maxDelay: 1_000, stableAfter: 5_000 },
+      stream: {
+        idleTimeout: 12_000,
+        rotate: { interval: 60_000, mode: "overlap", timeout: 2_000 },
+        pauseWhenHidden: true,
+        endSignal: "[DONE]",
+        events: ["ALARM"],
+        reconnectOnEnd: false,
+        strictContentType: false,
+      },
+      limits: { maxBufferSize: 2_048, overflowPolicy: "drop", yieldEvery: 20 },
+      hooks: { status, gap: () => undefined },
+      autoStart: false,
+    });
+
+    expect(flat).toMatchObject({
+      url: "/s",
+      method: "GET",
+      credentials: "include",
+      resumeFrom: "7",
+      persistKey: "alarm",
+      persistStorage: null,
+      maxRetry: 3,
+      retryBaseDelay: 250,
+      retryMaxDelay: 1_000,
+      stableAfter: 5_000,
+      idleTimeout: 12_000,
+      rotateInterval: 60_000,
+      rotateMode: "overlap",
+      rotateTimeout: 2_000,
+      pauseWhenHidden: true,
+      endSignal: "[DONE]",
+      events: ["ALARM"],
+      reconnectOnEnd: false,
+      strictContentType: false,
+      maxBufferSize: 2_048,
+      overflowPolicy: "drop",
+      yieldEvery: 20,
+      autoStart: false,
+    });
+    expect(flat.body).toBe(body);
+    expect(flat.parse).toBe(JSON.parse);
+    expect(flat.onStatus).toBe(status);
+    expect(flat.retry).toBeUndefined();
+  });
+
+  it("accepts a rotation interval as a number", () => {
+    expect(normalizeOptions({ url: "/s", stream: { rotate: 30_000 } }).rotateInterval).toBe(30_000);
+  });
+
+  it("keeps a policy function and ignores the backoff knobs it owns", () => {
+    const policy = () => 100;
+    const flat = normalizeOptions({ url: "/s", retry: policy, maxRetry: 9 });
+    expect(flat.retry).toBe(policy);
+    // A flat alias still lands; the policy simply ignores it at runtime.
+    expect(flat.maxRetry).toBe(9);
+  });
+
+  it("lets the group win over the deprecated flat alias", () => {
+    const flat = normalizeOptions({
+      url: "/s",
+      credentials: "omit",
+      idleTimeout: 1_000,
+      onStatus: () => undefined,
+      request: { credentials: "include" },
+      stream: { idleTimeout: 5_000 },
+    });
+    expect(flat.credentials).toBe("include");
+    expect(flat.idleTimeout).toBe(5_000);
+  });
+
+  it("is idempotent, so a normalised object can be normalised again", () => {
+    const once = normalizeOptions({ url: "/s", stream: { idleTimeout: 3_000 } });
+    expect(normalizeOptions(once)).toEqual(once);
   });
 });
 
@@ -138,15 +231,26 @@ describe("plugins", () => {
 });
 
 describe("share keys", () => {
-  it("includes flags and resolves body factories", () => {
+  it("resolves body factories and ignores what does not reach the server", () => {
     const base = deriveShareKey({ url: "/s", body: { a: 1 } });
     const viaFactory = deriveShareKey({ url: "/s", body: () => ({ a: 1 }) });
     expect(viaFactory).toBe(base);
 
-    const withFlag = deriveShareKey({ url: "/s", body: { a: 1 }, flags: ["GRID_MAP"] });
-    expect(withFlag).not.toBe(base);
-
     const changedFilter = deriveShareKey({ url: "/s", body: () => ({ a: 2 }) });
     expect(changedFilter).not.toBe(base);
+
+    // Nothing on the wire changes, so the decoder must not split the connection.
+    const withParse = deriveShareKey({ url: "/s", body: { a: 1 }, parse: JSON.parse });
+    expect(withParse).toBe(base);
+  });
+
+  it("derives one key for the grouped and the flat spelling", () => {
+    const flat = deriveShareKey({ url: "/s", body: { a: 1 }, events: ["ALARM"] });
+    const grouped = deriveShareKey({
+      url: "/s",
+      request: { body: { a: 1 } },
+      stream: { events: ["ALARM"] },
+    });
+    expect(grouped).toBe(flat);
   });
 });

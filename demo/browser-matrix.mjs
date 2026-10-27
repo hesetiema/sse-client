@@ -131,7 +131,14 @@ async function openPage(port) {
     errors.push(params.exceptionDetails?.exception?.description ?? params.exceptionDetails?.text ?? "unknown");
   });
   cdp.on("Log.entryAdded", (params) => {
-    if (params.entry?.level === "error") errors.push(params.entry.text);
+    if (params.entry?.level !== "error") return;
+    // The error500/error401 cases assert these responses on purpose; counting them
+    // as page errors would make the summary noisy without adding signal.
+    const url = params.entry.url ?? "";
+    if (url.includes("/subscribe?") && /\((Internal Server Error|Unauthorized)\)/.test(params.entry.text)) {
+      return;
+    }
+    errors.push(params.entry.text);
   });
 
   await cdp.send("Page.enable");
@@ -278,9 +285,14 @@ const SCENARIOS = [
       reconnectOnEnd: false,
     },
     wait: 2600,
+    // The loss surfaces as a gap (`reason: "drop"`) plus the `dropped` counter,
+    // not as a dedicated overflow callback.
     check: (ui) => [
-      ui.status === "closed" && ui.text.includes("overflow") && !ui.text.includes("protocol"),
-      `status=${ui.status} overflowRow=${ui.text.includes("overflow")} protocol=${ui.text.includes("protocol")}`,
+      ui.status === "closed" &&
+        ui.text.includes("gap") &&
+        ui.text.includes("drop") &&
+        !ui.text.includes("protocol"),
+      `status=${ui.status} gapRow=${ui.text.includes("gap")} protocol=${ui.text.includes("protocol")}`,
     ],
   },
   {
@@ -308,7 +320,12 @@ const SCENARIOS = [
     title: "Silent stream + idleTimeout",
     config: { endpoint: "direct", scenario: "silent", idle: 1500, maxRetry: 2 },
     wait: 3200,
-    check: (ui) => [`${ui.text.includes("heartbeat")}`, `heartbeat=${ui.text.includes("heartbeat")} attempts=${ui.attempts}`],
+    // `check` must return a boolean first: an interpolated string is always truthy,
+    // which silently turned this case into an unconditional pass.
+    check: (ui) => [
+      ui.text.includes("heartbeat") && ui.attempts >= 1,
+      `heartbeat=${ui.text.includes("heartbeat")} attempts=${ui.attempts}`,
+    ],
   },
   {
     id: "offline-recover",
@@ -337,6 +354,95 @@ const SCENARIOS = [
       ui.status === "open" && ui.count > 4 && !/close error/.test(ui.text),
       `status=${ui.status} count=${ui.count} closedByRace=${/close error/.test(ui.text)}`,
     ],
+  },
+  {
+    id: "heartbeat-watchdog",
+    title: "Heartbeat comments + idleTimeout",
+    // Comments are not events, so the counter stays at 0; an idleTimeout below the
+    // heartbeat interval must still notice the stream is alive... and, when the
+    // heartbeat is slower than the timeout, reconnect instead of hanging.
+    config: { endpoint: "direct", scenario: "heartbeat", interval: 2000, idle: 1000, maxRetry: 2 },
+    wait: 3600,
+    check: (ui) => [
+      ui.count === 0 && ui.text.includes("heartbeat") && ui.attempts >= 1,
+      `count=${ui.count} heartbeatError=${ui.text.includes("heartbeat")} attempts=${ui.attempts}`,
+    ],
+  },
+  {
+    id: "retry-field",
+    title: "retry: field parsed, reconnect",
+    // The `retry:` line must not be dispatched as an event and must not break the
+    // stream; the replayed ids prove the reconnect happened. The ~2s delay itself
+    // is not asserted: the log only has second resolution.
+    config: { endpoint: "direct", scenario: "retry-field", interval: 200, maxRetry: 2 },
+    wait: 2600,
+    check: (ui) => [
+      ui.count >= 2 && !ui.text.includes("protocol"),
+      `count=${ui.count} protocol=${ui.text.includes("protocol")}`,
+    ],
+  },
+  {
+    id: "no-blank-line",
+    title: "Unterminated event hits the cap",
+    // 4KB per 10ms ≈ 400KB/s, so the 1MB cap needs a bit over 2.5s; wait for margin.
+    config: { endpoint: "direct", scenario: "no-blank-line", interval: 100 },
+    wait: 5000,
+    check: (ui) => [
+      ui.text.includes("protocol") && ui.status === "closed",
+      `status=${ui.status} protocol=${ui.text.includes("protocol")}`,
+    ],
+  },
+  {
+    id: "slow-handshake",
+    title: "Slow headers stay 'connecting'",
+    // 3s before the response headers: nothing should look open, and no event may
+    // be counted before the handshake completes.
+    config: { endpoint: "direct", scenario: "slow", interval: 300 },
+    wait: 2000,
+    check: (ui) => [
+      ui.count === 0 && ui.status === "connecting",
+      `count=${ui.count} status=${ui.status}`,
+    ],
+  },
+  {
+    id: "html-login-page",
+    title: "200 + text/html is rejected",
+    config: { endpoint: "direct", scenario: "html" },
+    wait: 2200,
+    check: (ui) => [
+      ui.count === 0 && ui.status === "closed" && ui.attempts === 1 && ui.text.includes("protocol"),
+      `count=${ui.count} status=${ui.status} attempts=${ui.attempts}`,
+    ],
+  },
+  {
+    id: "error500-backoff",
+    title: "500 retried, then exhausted",
+    config: { endpoint: "direct", scenario: "error500", maxRetry: 2 },
+    wait: 5000,
+    check: (ui) => [
+      ui.status === "closed" && ui.attempts >= 2 && ui.text.includes("500"),
+      `status=${ui.status} attempts=${ui.attempts} saw500=${ui.text.includes("500")}`,
+    ],
+  },
+  {
+    id: "error401-terminal",
+    title: "401 is terminal, no retry",
+    config: { endpoint: "direct", scenario: "error401", maxRetry: 2 },
+    wait: 2600,
+    check: (ui) => [
+      ui.status === "closed" && ui.attempts === 1 && ui.text.includes("401"),
+      `status=${ui.status} attempts=${ui.attempts} saw401=${ui.text.includes("401")}`,
+    ],
+  },
+  {
+    id: "accel-direct",
+    title: "accel: X-Accel-Buffering stream",
+    // `accel` is the normal stream plus `X-Accel-Buffering: no`. Asserted on the
+    // direct endpoint, where the header is inert; its effect on :8082 depends on
+    // gzip and is left to the manual demo instead of flaking CI.
+    config: { endpoint: "direct", scenario: "accel", interval: 250 },
+    wait: 2200,
+    check: (ui) => [ui.count >= 4 && ui.status === "open", `count=${ui.count} status=${ui.status}`],
   },
 ];
 

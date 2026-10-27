@@ -15,8 +15,10 @@ import { SSEClient } from "@songfreedom/sse-client";
 
 const client = new SSEClient({
   url: "/api/push/subscribe",
-  body: { topics: ["alarm"] },
-  headers: () => ({ authorization: `Bearer ${getToken()}` }),
+  request: {
+    body: { topics: ["alarm"] },
+    headers: () => ({ authorization: `Bearer ${getToken()}` }),
+  },
   parse: (raw) => JSON.parse(raw),
 });
 
@@ -29,24 +31,141 @@ client.on("ALARM", (alarm) => console.log(alarm.level));
 | --- | --- |
 | 原生 `EventSource` | 无法设置请求头（没法带鉴权 token）、只支持 GET、不能带请求体、重连行为不可控 |
 | [`@microsoft/fetch-event-source`](https://github.com/Azure/fetch-event-source) | 已归档。非 2xx 响应必须自己在 `onopen` 里拒绝，否则会静默无限重连；重试间隔固定；不保存 `Last-Event-ID` |
-| `axios` | 浏览器里读不了流式响应（`responseType: "stream"` 只有 Node 支持）。在 `onDownloadProgress` 里拼接 `responseText` 会破坏多字节字符 |
 
-本库 gzip 后约 3 kB，无运行时依赖，只要求环境提供 `fetch` 和 `ReadableStream`。
+核心客户端压缩（min+gzip）后约 6 kB，`.` 入口全量导出约 9 kB（含共享连接、fanout、ring buffer、
+batcher）。无运行时依赖，只要求环境提供 `fetch` 和 `ReadableStream`。
 
-## 特性
+## 核心链路：从数据源到 Web 展示
 
-- **POST + JSON 请求体**，支持任意请求头，也支持每次重连重新求值的请求头函数
-- **自动重连**：指数退避 + 抖动；终态错误（401/403/404）立即停止
-- **断点续传**：通过 `Last-Event-ID` 让重连从断开处继续；配合 `persistKey` 还能跨页面刷新延续
-- **漏数据信号**（`onSuspectGap`）：客户端无法证明流连续时主动上报，让应用重拉快照，而不是把错数字静默画出来
-- **续传校验**（`onResume`）：重连后上报新流跳过了多少（`skipped`、`continuous`）；id 不透明时明确保持沉默
-- **带类型的事件分发**：一条连接服务多个订阅者，`on()` 会根据事件表推导载荷类型
-- **空闲看门狗**：应对静默的流；**主动轮转**：应对连接还活着但收不到数据的场景
-- **离线感知**：断网时暂停，网络恢复后立即重连
-- **可插拔的重试策略**，包括「刷新 token 后重试」这类异步策略
-- **连接复用**：按 key 共享连接并做引用计数；**多标签页共用一条连接**（`./multi-tab`）
-- **有界历史**：`createRingBuffer`，配合 `createBatcher`（支持前导触发）在写状态前合并
-- 独立入口提供可选的 **Vue 3** 组合式函数
+一条典型的工业现场链路（本库只覆盖最后一段）：
+
+```text
+现场设备/PLC ─► 接入网关 ─► 消息总线 ─► 流计算 ─► 存储分层 ─► 推送服务 ─► Web
+ OPC UA/Modbus  MQTT/EMQX     Kafka      Flink    TSDB+Redis   SSE/WS    Vue/React
+```
+
+设备侧 OPC UA / Modbus 在接入网关转成 MQTT（EMQX 承连接与 QoS，链路中断时网关缓存补传），再经规则引擎 / Connector 桥接到 Kafka；Flink 做窗口聚合与告警规则，实时事件直连推送服务，TSDB 只服务快照与历史。浏览器侧由推送服务转成 SSE——单向、能穿网关、带 `Last-Event-ID` 续传，需要双向命令才上 WebSocket。两个「网关」不是一回事：接入网关做协议转换，HTTP 网关只负责不缓冲地转发字节。
+
+模块视图（实线为数据面，虚线为控制与治理）：
+
+```mermaid
+flowchart TB
+    DEV["现场设备 / PLC<br/>OPC UA · Modbus"] --> EDGE["接入网关<br/>协议转换 · 断网缓存补传"]
+    EDGE -- "MQTT / EMQX" --> BUS["消息总线<br/>Kafka"]
+    BUS --> FLINK["流计算<br/>Flink · 窗口聚合 · 告警规则"]
+    FLINK --> STORE["存储分层<br/>TSDB 历史 · Redis 最新值"]
+    FLINK -- 实时事件 --> SRV["推送服务<br/>订阅路由 · 事件 id · 快照 · 心跳"]
+    STORE -- 快照 / 历史 --> SRV
+    SRV --> GW["HTTP 网关：proxy_buffering off · gzip off · 透传 Last-Event-ID"]
+
+    subgraph TRANSPORT["传输层 · SSEClient：准确 · 即时"]
+        T1["fetch 流式读取<br/>POST + JSON · headers/body 工厂"] --> T2["帧解析 createSSEParser<br/>分片 chunk · CRLF · BOM · maxBufferSize 双上限"]
+        T2 --> T3["解码与事件路由<br/>TextDecoder 流式 · on / once · events 白名单"]
+        T4["续传与重连<br/>Last-Event-ID · persistKey · 退避 + 抖动 · Retry-After<br/>idleTimeout 看门狗 · rotate 轮转"] -. 维持与恢复 .-> T1
+    end
+
+    subgraph FRONTEND["前端层 · 构件：内存 · 渲染节奏"]
+        F1["createBatcher 微批合并<br/>interval 300ms · maxPending · chunkSize"]
+        F2["fanout 扇出<br/>一订阅多消费者 · latest 快照"]
+        F3["createRingBuffer 有界历史<br/>覆盖最旧 · evicted"]
+        F4["Vue 3：useSSE / useSharedSSE<br/>when 门 · 显式 dispose"]
+        F1 --> F2 --> F3
+    end
+
+    subgraph GOV["连接治理：多组件 · 多标签页"]
+        C1["acquireSSEClient：引用计数共享"]
+        C2["useSharedSSEClient：订阅热切换 · grace"]
+        C3["createMultiTabSSE：Web Locks 选主 + BroadcastChannel 中继"]
+    end
+
+    GW --> T1
+    T3 --> F1
+    F2 -.-> F4
+    F3 --> VIEW["Web 展示：趋势图 · 测点列表 · 告警中心 · 大屏"]
+    GOV -. 多消费者复用同一条物理连接 .- TRANSPORT
+```
+
+本库负责最后一段：`SSEClient` 管传输，`createBatcher` / `fanout()` / `createRingBuffer` 管消费。三个要求各对应一组机制：
+
+- **准确**：`Last-Event-ID` 续传 + `onSuspectGap` / `onResume` 证明连续性；`parse` 与回调抛错被隔离，终态 401/403/404 立即停止。
+- **即时**：流式推送 + `idleTimeout` 僵尸回收 + 指数退避（±20% 抖动、尊重 `Retry-After`）+ `overlap` 轮转零空档。
+- **内存**：pull 背压 + `maxBufferSize`（默认 1MB）双上限 + `createRingBuffer` 定容；`yieldEvery` / `createBatcher` 防长任务。
+
+## 能力地图：传输层 · 前端层 · 连接治理
+
+**传输层**——准确 / 即时 / 内存的第一现场：
+
+- fetch 传输：POST + JSON 请求体、任意请求头；`headers` / `body` 传函数则每次（重）连重新求值
+- 事件路由：`on()` 从事件表推导载荷类型，`on("*")` 通配，`once()` 单次投递
+- 帧解析：任意切分的 chunk、多行 `data`、CRLF 拆分、BOM、注释心跳；`maxBufferSize` 双重上限，`overflowPolicy: "close" | "drop"`
+- 断线续传：`Last-Event-ID` + `resume.persist` 跨刷新 + `resume.from` 外部位点播种；`hooks.gap` / `hooks.resume` 连续性信号
+- 重连治理：指数退避 + 抖动、`Retry-After`（delta-seconds 与 HTTP-date）、流内 `retry:` 字段、可异步自定义 `retry`；终态 401/403/404 立即停止
+- 连接健康：空闲看门狗、定时轮转（`restart` / `overlap`）、离线挂起与恢复、`pauseWhenHidden`、`endSignal` 正常收尾
+
+**前端层**——展示节奏与内存的现场：
+
+- `createBatcher` 微批合并：按业务 key 合并高频更新，窗口内只留最新值（默认 300ms；`maxPending` 控内存，`chunkSize` 限长任务，`leading` 照顾稀疏面板）
+- `client.fanout()` 扇出：一条订阅派发给多个消费者，每事件保留最新值，晚挂载组件立即渲染
+- `createRingBuffer` 有界历史：O(1) 写入、覆盖最旧，回答「最近 N 条」而不是「最近 T 秒」
+- Vue 3 `useSSE` / `useSharedSSE`：`status` / `lastEvent` 响应式、`when` 就绪门、显式 `dispose`（微前端双 Vue 副本也不泄漏）
+- 底层构件：`createSSEParser` / `createSSEMessageStream`（标准 `TransformStream`）供自定义传输复用
+
+**连接治理**——多组件、多标签页不互相踩：
+
+- `acquireSSEClient` 按 key 共享连接（引用计数），HTTP/1.1 同源 6 连接限制下不浪费扇出
+- `useSharedSSEClient` 订阅热切换：key 变了搬监听器，旧连接等最后一个使用方离开才关
+- `createMultiTabSSE`（从 `@songfreedom/sse-client/multi-tab` 引入）多标签页一条连接：Web Locks 选主 + BroadcastChannel 中继，leader 关闭后 follower 从 `lastId` 接管（`promote` 报 gap），平台能力缺失降级 `solo`
+- `@songfreedom/sse-client/testing` 的 `createMockSSEFetch`：进程内确定性复现重连 / 续传 / 挂死网关 / 轮转
+
+## 消费侧示例
+
+业务层怎么消费，直接看代码：[`demo/consumers/`](./demo/consumers/README.zh-CN.md)。
+每个页面带可编辑面板，场景、间隔等参数直接在浏览器里切换，不用改源码。
+
+| 目录 | 场景 | 关键构件 |
+| --- | --- | --- |
+| `alarm-center/` | 告警中心：续传、401 自愈、按 id 去重 | `SSEClient` · 函数式 `headers` · `retry` · `resume.persist` |
+| `point-board/` | 测点看板：高频测点、按帧重绘、内存有界 | `createBatcher` · `fanout()` · `createRingBuffer` · `yieldEvery` |
+| `multi-tab/` | 多标签页只开一条连接 | `createMultiTabSSE` |
+| `vue-shared/` | Vue 多组件共享 + 订阅热切换 | `useSharedSSE` · `subscription` getter |
+
+```bash
+pnpm build && pnpm demo:server
+# 打开 http://127.0.0.1:8787/demo/consumers/<目录>/index.html
+```
+
+## 选型：用哪个入口
+
+包对外有四个子路径——`.`、`./vue`、`./multi-tab`、`./testing`——但选哪个，取决于**三种东西**
+里哪一种正在被重复：消费者、订阅、标签页。
+
+| 被重复的是什么 | 用哪个 | 代价 |
+| --- | --- | --- |
+| 没有重复：一个消费者、一个固定订阅 | `new SSEClient(options)` | 生命周期自己管，卸载时 `close()` |
+| 多个组件、**同一个**订阅 | `acquireSSEClient(key, create)` | 引用计数，每个消费者都要 `release()`；订阅本身不能变 |
+| 多个组件、订阅会**变**（租户、筛选、时间范围） | `useSharedSSEClient({ grace })` | 监听簿记由你做；切 key 会立刻关闭旧连接 |
+| Vue 组件 | `useSSE(options)` / `useSharedSSE(options)` | 刻意做薄：ref + `on()` + `dispose()`；没有历史，`shared` 模式不暴露 `configure` |
+| 同一个流出现在**多个标签页** | `createMultiTabSSE(options)`（`./multi-tab`） | 需要 Web Locks **和** `BroadcastChannel`；载荷必须可结构化克隆 |
+| 同标签页多个消费者，还要「现在是多少」 | `client.fanout()` | 只留最新值——它不是 store，也不留历史 |
+| 要历史，或要控制重绘节奏 | `createRingBuffer` + `createBatcher` | 容量与间隔由你定，库不提供默认 |
+| 什么都不消费，只想观察 | `client.use(plugin)` | 挂载时跑一次，只在 `close()` 拆；不能热插拔 |
+
+几条最容易踩错的边界：
+
+- **共享会合并 `parse`。** key 只覆盖 `url` / `method` / `body` / `events`，而且
+  **先创建者**的 `parse` 获胜——第二个使用方静默拿到它的返回值。解码方式不同就用两个 key。
+- **切 key 不受 grace 保护。** `grace` 只延后 `close()` 的释放（路由切换、重新挂载）。
+  `F1 → F2 → F1` 就是两次重连，该 debounce 的是切换，而不是让滑块每一像素产生一个 key。
+- **`fanout()` 不是 store。** 它只按事件名保留**最新**载荷：没有历史、没有窗口、没有回放。
+  最后一个消费者退订后，底层的 `"*"` 订阅仍然保留（这样 `latest()` 还读得到），只有
+  `dispose()` 才释放它。
+- **ring buffer 是数量界，不是时间窗。** 它回答「最后 N 条」，永远不回答「最近 T 秒」。
+- **batcher 改的是节奏，不是顺序。** `leading: true` 时空闲窗口的第一个值立刻投递，且**不进**
+  随后的尾批；设了 `chunkSize` 后，`onFlush` 会被调用多次（每片一次），不是每窗口一次。
+- **`multi-tab` 是降级，不是回退方案。** 两个平台能力缺一个，每个标签页都报告 `solo` 并各自
+  建连。这是有意的：手写的降级协议会脑裂。
+- **插件是挂载期行为，不是生命周期。** 它在你调用 `use()` 时跑一次，teardown 只在 `close()`
+  执行——跟不上 `start()` / `stop()` 的循环。
 
 ## 安装
 
@@ -73,16 +192,17 @@ import { SSEClient } from "@songfreedom/sse-client";
 
 interface Events {
   ALARM: { level: "high" | "low"; deviceId: string };
-  IOT: { objectId: string; value: string };
+  POINT: { objectId: string; value: string };
 }
 
 const client = new SSEClient<Events>({
-  url: `${gateway}/server-event/sse/subscribe`,
-  method: "POST",
-  body: [{ subscribeType: "SE", instanceType: "PROJECT" }],
-  headers: () => authHeaders(),          // 每次尝试前重新求值
+  url: "/api/sse/subscribe",
+  request: {
+    body: { topics: ["alarm"] },
+    headers: () => authHeaders(),  // 每次尝试前重新求值
+  },
   parse: (raw) => JSON.parse(raw),
-  idleTimeout: 45_000,                   // 服务端每 15s 发一次心跳时可这样设置
+  stream: { idleTimeout: 45_000 }, // 服务端每 15s 一次心跳
 });
 
 const off = client.on("ALARM", (alarm) => {
@@ -108,7 +228,7 @@ interface Events {
 
 const { status, lastEvent, on, dispose } = useSSE<Events>({
   url: "/api/push/alarm",
-  body: { topics: ["alarm"] },
+  request: { body: { topics: ["alarm"] } },
   parse: (raw) => JSON.parse(raw),
 });
 
@@ -120,20 +240,15 @@ const connected = computed(() => status.value === "open");
 </script>
 ```
 
-`useSSE` 刻意做得很薄：`status` / `lastEvent` / `error` 三个 ref、用于分发的 `on()`，
-以及一个 `dispose()`——退掉本组合式函数注册的所有订阅并关闭连接。
+`useSSE` 只提供 `status` / `lastEvent` / `error` 三个 ref、用于分发的 `on()`，以及一个
+`dispose()`——退掉本组合式函数注册的订阅并关闭连接。它不提供历史数组，缓冲区用
+`createRingBuffer` 自己组合（见 [`demo/consumers/point-board/`](./demo/consumers/point-board/main.js)）。
 
-**它不提供历史数组。** 视图要留多少条、要不要降采样、多久重绘一次，都是业务决策，
-库给不出合适的默认值——给了也只会悄悄谁都不合适。缓冲区用 `createRingBuffer` 自己组合
-（见[大列表与图表：视图窗口自己组合](#大列表与图表视图窗口自己组合)）。
+清理是显式的，不依赖作用域：宿主与库解析到**不同副本的 Vue** 时（qiankun 子应用），
+`getCurrentScope()` 返回 `undefined`，带守卫的自动清理会静默泄漏连接。`dispose()` 幂等；
+`stop()` 只关闭连接，组合式函数仍可复用。
 
-清理是显式的，不依赖作用域。宿主与库解析到**不同副本的 Vue** 时（qiankun 子应用
-的常见情况），`getCurrentScope()` 会返回 `undefined`，带守卫的自动清理就变成静默的
-连接泄漏。`dispose()` 是幂等的，重复调用无害。`stop()` 关闭连接但保留组合式函数可用，
-`dispose()` 才是真正的销毁。
-
-加上 `shared: true`（或 `{ grace, keyOf }`）后，描述同一订阅的多个组件共用一条连接：
-释放按引用计数，某个组件卸载不会再顺带掐掉其它组件的连接。
+`shared: true`（或 `{ grace, keyOf }`）让描述同一订阅的多个组件共用一条连接，释放按引用计数。
 
 订阅目标还不确定时加 `when`。返回 false 期间一个请求都不发，详情页就不会先为「没有实例」
 开一条一次性订阅、紧接着又换掉：
@@ -143,7 +258,7 @@ const instanceId = ref<string>();
 const { status } = useSSE({
   url: "/api/push",
   when: () => !!instanceId.value,
-  body: () => [{ instanceId: instanceId.value }],
+  request: { body: () => [{ instanceId: instanceId.value }] },
 });
 ```
 
@@ -155,44 +270,46 @@ const { status } = useSSE({
 
 ### `new SSEClient(options)`
 
-| 参数 | 类型 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `url` | `string` | — | 请求地址，包含网关前缀 |
-| `method` | `"GET" \| "POST"` | `"POST"` | HTTP 方法 |
-| `body` | `unknown \| (() => unknown)` | — | 序列化为 JSON；字符串、`Blob`、`FormData` 原样发送。传函数则每次（重）连前重新求值，可跟随响应式筛选条件。请保持纯函数：`deriveShareKey` 也会求值 |
-| `credentials` | `RequestCredentials` | `"same-origin"` | 订阅接口跨域且靠 cookie 鉴权时传 `"include"` |
-| `flags` | `string[]` | — | 拼在 URL 上的无值标记：`["GRID_MAP"]` → `.../subscribe?GRID_MAP`。参与共享 key |
-| `headers` | `HeadersInit \| () => HeadersInit \| Promise<HeadersInit>` | — | 传函数可在每次（重）连时重新计算请求头 |
-| `parse` | `(raw: string) => unknown` | 原样返回 | 载荷解码器；可用包内的 `jsonParse`，非 JSON 帧保留原文而不是丢弃 |
-| `resumeFrom` | `string` | — | 首次请求的续传位点，作为 `Last-Event-ID` 发送；用于从上次页面停留处继续 |
-| `persistKey` | `string \| boolean` | — | 把 `lastEventId` 落到存储，跨刷新延续。`true` 时按订阅推导键；写入节流到 1 次/秒，并在关闭、`pagehide` 时立即落盘 |
-| `persistStorage` | `ResumeStorage \| null` | `sessionStorage` | `persistKey` 使用的存储；传 `null` 关闭（SSR、受限 iframe） |
-| `onSuspectGap` | `(info: SSEGapInfo) => void` | — | 流可能不连续（`reconnect` / `resume` / `rotate` / `drop` / `promote`）；每次「一段」只上报一次 |
-| `onResume` | `(info: SSEResumeInfo) => void` | — | 重连后第一条可识别事件：新流跳过多少（`skipped` / `continuous`） |
-| `idleTimeout` | `number` | `0` | 超过该时长没有收到任何字节就重连，建议设为心跳间隔的 3 倍左右 |
-| `rotateInterval` | `number` | `0` | 按固定周期重连，即使连接看起来正常 |
-| `rotateMode` | `"restart" \| "overlap"` | `"restart"` | `restart` 先关后开；`overlap` 接管预先建立好的替换连接（无空档） |
-| `rotateTimeout` | `number` | `30000` | `overlap` 模式下替换连接的等待上限 |
-| `retry` | `(ctx) => number \| false \| Promise<number \| false>` | — | 自定义重试策略，会覆盖内置退避 |
-| `maxRetry` | `number` | `Infinity` | 重试次数上限（仅在未提供 `retry` 时生效） |
-| `retryBaseDelay` | `number` | `1000` | 首次重试前的等待时间（ms） |
-| `retryMaxDelay` | `number` | `30000` | 退避上限（ms） |
-| `reconnectOnEnd` | `boolean` | `true` | 服务端正常结束流后是否重连 |
-| `stableAfter` | `number` | `10000` | 一次连接存活超过该时长后重置重试计数 |
-| `strictContentType` | `boolean` | `true` | 要求响应为 `content-type: text/event-stream` |
-| `maxBufferSize` | `number` | `1MB` | 单条消息缓冲区上限（字符数） |
-| `overflowPolicy` | `"close" \| "drop"` | `"close"` | 超限时：断开（终态 `protocol` 错误）或只丢该条、连接继续 |
-| `yieldEvery` | `number` | `0` | 每个任务最多解析多少条事件，然后让出主线程；`0` 表示整块一次处理 |
-| `endSignal` | `string` | — | 把这个 `data` 值视为流结束，例如 `"[DONE]"` |
-| `events` | `string[]` | — | 事件名白名单 |
-| `pauseWhenHidden` | `boolean` | `false` | 页面隐藏时挂起，页面可见时重连 |
-| `autoStart` | `boolean` | `true` | 在构造函数里直接建立连接 |
-| `fetch` | `FetchLike` | 全局 `fetch` | 自定义传输实现 |
-| `onHandlerError` | `(error) => void` | `console.error` | 回调抛错时的兜底处理 |
+只有 `url` 是必填的。其余按「影响什么」分组，默认值就是这套客户端的常用配置。
 
-生命周期钩子既可以通过选项传入（`onOpen`、`onMessage`、`onStatus`、`onError`、
-`onClose`、`onOverflow`、`onSuspectGap`、`onResume`），也可以稍后用方法订阅，两种写法等价。
+| 分组 | 字段 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| — | `url` | `string` | — | 请求地址，包含网关前缀 |
+| `request` | `method` | `"GET" \| "POST"` | `"POST"` | HTTP 方法 |
+| `request` | `body` | `unknown \| (() => unknown)` | — | 序列化为 JSON；字符串、`Blob`、`FormData` 原样发送。传函数则每次（重）连前重新求值，可跟随响应式筛选条件。请保持纯函数：`deriveShareKey` 也会求值 |
+| `request` | `headers` | `HeadersInit \| () => HeadersInit \| Promise<HeadersInit>` | — | 传函数可在每次（重）连时重新计算请求头 |
+| `request` | `credentials` | `RequestCredentials` | `"same-origin"` | 订阅接口跨域且靠 cookie 鉴权时传 `"include"` |
+| `request` | `fetch` | `FetchLike` | 全局 `fetch` | 自定义传输实现 |
+| — | `parse` | `(raw: string) => unknown` | 原样返回 | 载荷解码器；可用包内的 `jsonParse`，非 JSON 帧保留原文而不是丢弃 |
+| `resume` | `from` | `string` | — | 首次请求的续传位点，作为 `Last-Event-ID` 发送；用于从上次页面停留处继续 |
+| `resume` | `persist` | `string \| boolean` | — | 把 `lastEventId` 落到存储，跨刷新延续。`true` 时按订阅推导键；写入节流到 1 次/秒，并在关闭、`pagehide` 时立即落盘 |
+| `resume` | `storage` | `ResumeStorage \| null` | `sessionStorage` | `persist` 使用的存储；传 `null` 关闭（SSR、受限 iframe） |
+| `retry` | *（函数）* | `(ctx) => number \| false \| Promise<number \| false>` | — | 自定义策略：延迟完全由它决定，下面的退避参数被忽略 |
+| `retry` | `max` | `number` | `Infinity` | 重试次数上限 |
+| `retry` | `baseDelay` | `number` | `1000` | 首次重试前的等待时间（ms） |
+| `retry` | `maxDelay` | `number` | `30000` | 退避上限（ms） |
+| `retry` | `stableAfter` | `number` | `10000` | 一次连接存活超过该时长后重置重试计数 |
+| `stream` | `idleTimeout` | `number` | `0` | 超过该时长没有收到任何字节就重连，建议设为心跳间隔的 3 倍左右 |
+| `stream` | `rotate` | `number \| { interval, mode?, timeout? }` | `0` | 按固定周期重连。数字是 `{ interval }` 的简写；`mode` 为 `"restart"`（默认）或 `"overlap"`（先建后接，无空档）；`timeout` 默认 `30000` |
+| `stream` | `pauseWhenHidden` | `boolean` | `false` | 页面隐藏时挂起，页面可见时重连 |
+| `stream` | `endSignal` | `string` | — | 把这个 `data` 值视为流结束，例如 `"[DONE]"` |
+| `stream` | `events` | `string[]` | — | 事件名白名单 |
+| `stream` | `reconnectOnEnd` | `boolean` | `true` | 服务端正常结束流后是否重连 |
+| `stream` | `strictContentType` | `boolean` | `true` | 要求响应为 `content-type: text/event-stream` |
+| `limits` | `maxBufferSize` | `number` | `1MB` | 单条消息缓冲区上限（字符数） |
+| `limits` | `overflowPolicy` | `"close" \| "drop"` | `"close"` | 超限时：断开（终态 `protocol` 错误）或只丢该条、连接继续——`dropped` 计数，`hooks.gap` 报 `reason: "drop"` |
+| `limits` | `yieldEvery` | `number` | `0` | 每个任务最多解析多少条事件，然后让出主线程；`0` 表示整块一次处理 |
+| `hooks` | `open` `message` `status` `error` `close` `gap` `resume` `handlerError` | 回调 | `handlerError` 兜底为 `console.error` | 观测钩子；每个都等价于对应的 `onXxx()` 方法 |
+| — | `autoStart` | `boolean` | `true` | 在构造函数里直接建立连接 |
 
+`hooks` 是生命周期订阅的声明式写法：`hooks.status` 与 `client.onStatus(...)`
+收到同样的事件，同一件事挑一种写法即可。要**做事**看 `hooks.gap`
+（`{ reason, lastId, attempt }`），要**记录**看 `hooks.resume`
+（`{ lastId, firstId, skipped, continuous }`）。
+
+分组字段优先于已废弃的平铺写法（`body`、`idleTimeout`、`onStatus` …），后者还会
+保留一个小版本。另有两个选项是直接删除而非废弃：`flags`（自己拼查询串）与
+`onOverflow`（看 `dropped`，或 `hooks.gap` 的 `reason: "drop"`）。
 #### 属性
 
 | 属性 | 类型 | 说明 |
@@ -201,7 +318,7 @@ const { status } = useSSE({
 | `closed` | `boolean` | 终态；为 `true` 时不会再重连 |
 | `attempts` | `number` | 连续重试次数，连接稳定后重置 |
 | `lastEventId` | `string` | 最新事件 id，重连时会带回服务端 |
-| `url` | `string` | 实际请求的地址，`flags` 已拼接 |
+| `url` | `string` | 实际请求的地址 |
 | `dropped` | `number` | 因超限被丢弃的消息数（`overflowPolicy: "drop"` 时才会增长） |
 | `done` | `Promise<void>` | 连接终止时兑现，永不 reject |
 
@@ -216,7 +333,7 @@ const { status } = useSSE({
 | `on(event, handler)` | 订阅单个事件名，返回取消订阅函数 |
 | `on("*", handler)` | 订阅所有消息 |
 | `once(event, handler)` | 只订阅一次投递 |
-| `onMessage` / `onStatus` / `onError` / `onOpen` / `onClose` / `onOverflow` / `onSuspectGap` / `onResume` | 生命周期订阅 |
+| `onMessage` / `onStatus` / `onError` / `onOpen` / `onClose` / `onSuspectGap` / `onResume` | 生命周期订阅（`hooks` 的命令式写法） |
 | `fanout()` | 一个 `"*"` 订阅派发给多个消费者，并为每个事件保留最新值（同一实例） |
 | `use(plugin)` | 挂载插件；插件返回的函数在连接关闭时执行一次 |
 
@@ -225,24 +342,20 @@ const { status } = useSSE({
 
 ### `useSharedSSEClient(config?)`
 
-`acquireSSEClient` 覆盖的是「一个订阅、多个消费者」；这里覆盖更难的另一半：
-**订阅本身会变**（楼层、租户、筛选、时间范围），而使用方一直挂在页面上。
-
-拿到的 handle 不是一条连接。它持有的是**你的订阅描述和你的监听器**；连接属于某个 key，
-由该 key 上的所有使用方共享。
+`acquireSSEClient` 覆盖的是「一个订阅、多个消费者」；这里覆盖更难的另一半：订阅本身会变，
+而使用方一直挂在页面上。handle 持有的是你的订阅描述和你的监听器；连接属于某个 key。
 
 ```ts
 const sse = useSharedSSEClient({ grace: 5_000 });
 
-sse.on("IOT", apply);                              // 先排队，此时还没建连
-sse.configure({ url, body: [{ floorId: "F1" }] }); // 复用或新建匹配的连接
-watch(floorId, (id) => sse.configure({ url, body: [{ floorId: id }] }));
+sse.on("POINT", apply);                             // 先排队，此时还没建连
+sse.configure({ url, request: { body: { tenantId: "acme" } } }); // 复用或新建匹配的连接
+watch(tenantId, (id) => sse.configure({ url, request: { body: { tenantId: id } } }));
 onScopeDispose(() => sse.release());
 ```
 
-`configure` 做四件事：算出 key；key 没变就直接返回；把监听器从旧 client 上解绑；挂到
-匹配的连接上（已有人持有就复用）；最后把旧 key 的引用计数减一。最后一步正是「切楼层
-不会打扰另一个仍在看旧楼层」的原因。
+`configure` 算出 key，没变就直接返回；否则把监听器搬到匹配的连接上（已有人持有就复用），
+再把旧 key 的引用计数减一——所以切换不会打扰仍挂在旧 key 上的使用方。
 
 | 调用 | 行为 |
 | --- | --- |
@@ -258,24 +371,21 @@ onScopeDispose(() => sse.release());
 连续性信号也属于 handle，理由相同：`onSuspectGap` 与 `onResume` 会随切换重新绑定，而挂在
 缓存下来的 `client` 上的监听，会在订阅搬走的那一刻静默失效。
 
-四个容易踩的点：
+这个 handle 特有的两点：
 
-- **body 相同但 `parse` 不同会被合并**。key 只覆盖 `url` / `method` / `body` / `events` / `flags`，
-  而且**先创建的那个 `parse` 获胜**——第二个使用方拿到的是它的返回值。需要区分就传 `keyOf`。
-- **切换不受 grace 保护**。`F1 → F2 → F1` 就是两次重连。要么 debounce 切换，要么把筛选
-  条件分桶进 key（时间范围取整到分钟），别让滑块每一像素产生一个新 key。
 - **`grace` 只作用于 `close()`**。它是为路由来回切导致的重挂准备的，不负责订阅切换。
 - **`useSSE({ shared: true })` 是固定订阅版本**，不暴露 `configure`。订阅要动就直接用 handle。
 
 `config`：`grace`（无引用后连接保留多久，毫秒，默认 0）、`keyOf`（默认 `deriveShareKey`）、
 `create`（客户端工厂，默认 `new SSEClient`）。
 
-订阅永远不变时用 `acquireSSEClient` 更合适——不需要那套监听簿记。只有一个消费者时直接
-`new SSEClient`；重复发生在标签页之间而不是组件之间时用 `createMultiTabSSE`。
+什么时候该用这个 handle、什么时候该换成别的，见上文〈选型：用哪个入口〉：订阅永远不变时用
+`acquireSSEClient` 更合适（不需要那套监听簿记）；重复发生在标签页之间而不是组件之间时用
+`createMultiTabSSE`。
 
 ### `deriveShareKey(options)`
 
-由 `url`、`method`、`body`、`events`、`flags` 生成稳定 key：对象键排序，数组按集合比较。
+由 `url`、`method`、`body`、`events` 生成稳定 key：对象键排序，数组按集合比较。
 `body` 传函数时会先求值再入 key，因此筛选条件变化就是换 key。导出它，是为了手写 `key`
 时能沿用同一套规则。
 
@@ -326,336 +436,27 @@ interface SSEResumeInfo {
 ——夹在 200ms 与 `retryMaxDelay` 之间——替代指数曲线；自定义 `retry` 策略可以
 读同一个字段。
 
-## 常见配方
+## 连续性：客户端能证明什么
 
-### 401 时刷新 token
+四个信号，四种职责。这个库被误用，多半是把其中一个接到了它答不了的问题上。
 
-重试策略可以是异步的，因此刷新可以在下一次尝试之前完成：
-
-```ts
-let refreshed = false;
-
-const client = new SSEClient({
-  url,
-  retry: async ({ error, attempt }) => {
-    if (error?.status === 401 && !refreshed) {
-      await refreshToken();
-      refreshed = true;
-      return 0; // 立即重试
-    }
-    return attempt > 5 ? false : Math.min(30_000, 1000 * 2 ** attempt);
-  },
-});
-```
-
-### 跨页面刷新续传
-
-`lastEventId` 只存在内存里，所以 F5 会让流从「现在」重新开始，页面加载期间服务端产生
-的数据被静默跳过。把位点持久化即可：
-
-```ts
-new SSEClient({
-  url,
-  persistKey: "alarm",   // 存到 sessionStorage 的这个键
-  // persistKey: true    // 按 url/method/body 推导键
-});
-```
-
-存储的位点会在首次请求之前读取。流式过程中写入被合并到最多 1 次/秒，并在关闭、挂起和
-`pagehide` 时立即落盘——不会变成每条消息一次同步写存储。位点来自别处（快照接口、URL、
-另一个标签页）时用 `resumeFrom`。
-
-### 漏数据后重同步
-
-客户端不可能知道重连期间跳过了什么，它只能表示「无法证明连续」。`onSuspectGap` 把这个
-不确定性变成可执行的事件：
-
-```ts
-const client = new SSEClient({
-  url,
-  persistKey: "iot",
-  onSuspectGap: async ({ reason, lastId }) => {
-    const snapshot = await fetchSnapshot(); // { id: "9042", data: [...] }
-    store.replaceAll(snapshot.data);
-    client.setResumePoint(snapshot.id);      // 下一次连接从这里继续
-  },
-});
-```
-
-`reason` 取值为 `reconnect`、`resume`（页面隐藏或断网）、`rotate`（仅 `restart` 模式）、
-`drop`（单条消息超过 `maxBufferSize`）和 `promote`（多标签页中 leader 消失，本标签页接管）。
-每「一段」只上报一次，所以十分钟的断线不会触发二十次快照请求。`setResumePoint` 不会打断
-正在运行的流：中途改写 `Last-Event-ID` 只会让解析器错位，而不是修复缺口。
-
-### 续传到底接上了没有
-
-`onSuspectGap` 说的是「我无法证明连续」。等新连接的第一条事件到达后，`onResume` 回答它
-留下的问题：
-
-```ts
-const client = new SSEClient({
-  url,
-  onResume: ({ firstId, skipped, continuous }) => {
-    if (continuous === false) {
-      metrics.increment("sse.resume.skipped", { skipped });
-    }
-    cursor.moveTo(firstId);
-  },
-});
-```
-
-两个 id 都是整数时，`skipped` 就是 `firstId - lastId`：`0` 表示服务端重放了最后一条，
-`> 1` 表示中间有事件丢了。id 不是整数时 `skipped` 与 `continuous` 都是 `undefined`——编造
-一个排序会得到看起来很有底气的错误结论，所以客户端选择什么都不说。它适合做观测；
-真正触发快照重拉的仍是 `onSuspectGap`。
-
-### 多标签页共用一条连接
-
-六个看板标签页就是六条指向同一路流的连接。借助 Web Locks 和 `BroadcastChannel`，标签页
-之间选出一个 leader，其它标签页回放 leader 中继过来的消息：
-
-```ts
-import { createMultiTabSSE } from "@songfreedom/sse-client/multi-tab";
-
-const sse = createMultiTabSSE({ url: "/api/push", body: { topics: ["iot"] } });
-sse.on("IOT", (point) => store.apply(point)); // 每个标签页都有，只有一条连接
-sse.role;                                     // "leader" | "follower" | "solo"
-```
-
-leader 标签页关闭后，排队中的 follower 接管锁，并从它最后看到的 id 续传——交接代价是
-一个 `Last-Event-ID` 缺口，而不是整条订阅重来。连续性信号同样会跨中继：接管的标签页上报
-`onSuspectGap({ reason: "promote" })`，`onResume` 则由当前持有连接的那个标签页转发。
-不支持 Web Locks 或 `BroadcastChannel` 时，
-每个标签页都报告 `solo` 并各自连接：这是降级但诚实的行为，好过一个可能脑裂的自研协议。
-`parse` 必须返回可结构化克隆的数据；`onOpen` 只在 leader 上触发，因为 `Response` 无法中继。
-
-### 一个连接，多个消费者
-
-`on("*")` 也能用，但每个消费者各自付一份通配符处理成本，而且没人记得上一条载荷。
-`fanout()` 给出一条订阅，外加每个事件的最新快照，晚挂载的组件可以立刻渲染而不是等下一次推送：
-
-```ts
-const feed = client.fanout();
-
-feed.on("IOT_DATA_CHANGE", applyPoint);   // 每个消费者各有自己的取消订阅
-feed.on("ABNORMAL_EVENT", pushAlarm);
-
-feed.latest("IOT_DATA_CHANGE");           // 最近一次载荷，没有则 undefined
-feed.count("IOT_DATA_CHANGE");            // 有多少消费者在监听
-```
-
-某个消费者抛错会经 `onHandlerError` 上报，不影响其它人。`dispose()` 丢掉全部消费者与源订阅；
-在那之前快照一直可读。
-
-### 共用一条连接
-
-HTTP/1.1 同源最多 6 条连接，而一个推送通道会长期占住其中一条。
-与其每个组件各开一条，不如共享：
-
-```ts
-import { acquireSSEClient } from "@songfreedom/sse-client";
-
-const { client, release } = acquireSSEClient("alarm", () => new SSEClient({ url, body }));
-onScopeDispose(release); // 最后一个使用者释放时才会真正关闭
-```
-
-### 订阅会变的时候用 handle
-
-一个楼层切换器，三个组件同时看同一路流，而楼层会在运行时变化：
-
-```vue
-<script setup lang="ts">
-const props = defineProps<{ floorId: string }>();
-
-const sse = useSharedSSEClient({ grace: 5_000 });
-sse.on("IOT", (point) => dock.apply(point)); // 先排队，等连接建好再挂上
-
-watch(
-  () => props.floorId,
-  (floorId) => sse.configure({ url, body: [{ floorId }] }),
-  { immediate: true },
-);
-
-onUnmounted(() => sse.release());            // 引用计数，而不是直接断开
-</script>
-```
-
-三个组件落到同一条连接上，是因为 key 由订阅自身推导（`url`、`method`、`body`、`events`、
-`flags`，数组按集合比较）——它们不需要事先约定一个字符串。切换楼层时三者一起搬走，旧连接
-只有在最后一个使用方也离开后才关闭。
-
-行为对照表、`close()` 与 `release()` 的区别、以及那些坑（共享 `parse`、切换不享受 grace）
-都在 [`useSharedSSEClient`](#usesharedsseclientconfig)。
-
-### 不用服务端的测试
-
-客户端只依赖 `fetch`，所以包里自带一个假的。重连、续传、卡死的网关、轮转都能在进程内
-确定性地复现，Node 与浏览器 runner 都一样：
-
-```ts
-import { SSEClient } from "@songfreedom/sse-client";
-import { createMockSSEFetch } from "@songfreedom/sse-client/testing";
-
-const mock = createMockSSEFetch({
-  script: attempt =>
-    attempt === 0
-      ? [{ id: "1", event: "ALARM", data: { level: "high" } }]
-      : [{ id: "2", event: "ALARM", data: { level: "low" } }],
-});
-
-const client = new SSEClient({
-  url: "/push",
-  body: { topics: ["alarm"] },
-  fetch: mock.fetch,
-  parse: JSON.parse,
-  maxRetry: 1,        // 脚本跑完重连一次就收工，`done` 才会兑现
-  retryBaseDelay: 0,
-});
-client.on("ALARM", handler);
-await client.done;
-
-expect(mock.calls[1].headers.get("last-event-id")).toBe("1");
-expect(mock.lastBody()).toEqual({ topics: ["alarm"] });
-```
-
-`keepOpen` 模拟持续订阅，`hang` 模拟迟迟不响应的网关，`script` 收到的参数是第几次尝试，
-因此重连可以返回不同的数据。
-
-### 大列表与图表：视图窗口自己组合
-
-客户端到「消息已分发」为止。视图留多少、多久重绘一次属于应用，两个构件覆盖大多数看板：
-
-```ts
-import { shallowRef, onUnmounted } from "vue";
-import { createRingBuffer, useSSE, jsonParse } from "@songfreedom/sse-client";
-
-const ring = createRingBuffer<Point>({ capacity: 2000 }); // 内存上限
-const rows = shallowRef<Point[]>([]);
-let frame = 0;
-
-const schedule = () => {
-  if (frame) return;
-  frame = requestAnimationFrame(() => {
-    frame = 0;
-    rows.value = ring.toArray(); // 每帧一个数组，而不是每条消息一个
-  });
-};
-
-const { dispose } = useSSE({
-  url: "/api/push",
-  parse: jsonParse,
-  onMessage: (message) => {
-    ring.push(message.data as Point);
-    schedule();
-  },
-});
-
-onUnmounted(dispose);
-```
-
-这里容量和发布量故意是同一个数：`toArray()` 每帧的成本是 O(capacity)，所以「留得起」
-的缓冲同时也是「发得起」的。两者一旦分家（留 6000 点、只渲染 500 条），应该是发布切片
-或者上虚拟列表，而不是调大容量然后再想办法。
-
-`ring.evicted` 记录被覆盖的条数，让界面可以诚实标注，而不是假装列表是完整的：
-
-```ts
-const truncated = computed(() => ring.evicted > 0); // 仅显示最近 2000 点
-```
-
-容量按 `时长 × 频率` 估算。这个数一旦开始变大，说明视图不是它该待的地方：要么服务端
-下采样（1s / 1min 聚合），要么改成分页查询。**不要在客户端压缩事件列表**——对报警列表
-做采样等于静默删掉几条报警，屏幕上没有任何东西会提示这一点。
-
-### 合并高频更新
-
-同一个实体每几百毫秒推一次时，写进状态前先做合并：
-
-```ts
-import { createBatcher } from "@songfreedom/sse-client";
-
-const batcher = createBatcher<string, Point>({
-  key: (point) => `${point.objectId}::${point.code}`,
-  interval: 300,
-  maxPending: 2000, // 窗口内最多攒 2000 个实体
-  onFlush: (points) => store.applyPoints(points),
-});
-
-client.on("IOT", (payload) => payload.data.forEach((p) => batcher.push(p)));
-```
-
-`maxPending` 缺省不设上限；一旦触发上限，淘汰**最久没有被更新**的 key，丢弃数记在 `batcher.dropped`。
-`dispose()` 之后 `push()` 变成空操作并计数，避免组件卸载后回调又把定时器重新拉起来。
-
-稀疏流量用 `leading: true`：空闲窗口的第一个值立即交付（一分钟才更新一次的看板不会晚
-一个窗口才变），跟在后面的突发仍然在尾窗里合并。
-
-一条共享连接被多个使用方消费时还有两点：`batcher.subscribe(fn)` 在 `onFlush` 之外增加订阅者，
-同一批数据只写一次状态、所有使用方都收到通知；`chunkSize` 把大窗口切片交付、切片之间让出主线程，
-5000 个实体不会变成一次长任务。
-
-### 高频与大流量：内存会不会涨
-
-不会无界增长，前提是三层的上限都在：
-
-1. **网络层**：读循环是 pull 模型（`await reader.read()`），处理慢了就不拉下一块，浏览器停止消费 socket，
-   TCP 窗口耗尽后服务端 `write()` 阻塞——背压天然传导到上游，不需要额外的流控协议。
-2. **解析层**：`buffer` 与「一个事件累计的 data 行」都受 `maxBufferSize`（默认 1MB）约束，超了默认
-   报 `protocol` 错误并断开。这是硬保护，不是"丢弃旧数据"策略：`huge`（单条 2MB）与 `no-blank-line`
-   （永不空行）两个场景走的就是这里。如果业务能接受丢帧但不能断，改成 `overflowPolicy: "drop"`：
-   只丢掉超限的那条（`dropped` 计数、`onOverflow` 回调），连接继续，并在下一个空行边界重新对齐。
-3. **应用层**：库自己不保存历史，消息派发完即可回收。要涨只能是业务囤：数组、响应式 store、日志表。
-
-实测（demo 里的 `flood` 场景 + `pnpm demo:memory`，Chrome 单 tab）：30 秒灌入 **368 MB**、48,000 条事件，
-堆峰值 4.6 MB，强制 GC 后回到 0.8 MB（基线 0.6 MB），DOM 节点数 117 → 117 不变。锯齿是没回收的临时对象，
-不是泄漏。细节与复现脚本见 [`demo/README.zh-CN.md`](./demo/README.zh-CN.md#6-高频--内存实测)。
-
-需要自己兜住的两件事：处理函数里别囤数据；单条消息都很大时，可以调低 `maxBufferSize` 让异常更早暴露。
-
-### 长任务：让出主线程
-
-`feed()` 是同步的：一个 chunk 里有多少条事件，就在同一个任务里解析并派发多少条。解析本身很便宜
-（实测约 3–10µs/条），真正会把主线程卡住的是**你自己的处理函数**——一条 1ms 的渲染乘以一个 chunk 里的
-1500 条，就是一次 1.4 秒的卡顿。`yieldEvery` 在解析和派发之间切片：
-
-```ts
-new SSEClient({ url, yieldEvery: 20 }); // 每 20 条让出一次，再继续
-```
-
-让出用 `scheduler.yield()`（不可用时退回 `setTimeout(0)`），abort 期间被打断与 `reader.read()` 的表现一致。
-
-demo 实测（`pnpm demo:memory --handler=1`，每条事件模拟 1ms 处理耗时，单块灌入 2000 条）：
-
-| `yieldEvery` | 单次最长阻塞 | 主线程总耗时 | 收到事件 |
+| 信号 | 何时触发 | 它告诉你什么 | 拿它做什么 |
 | --- | --- | --- | --- |
-| `0` | **1467 ms** | 2032 ms | 2000 |
-| `20` | **117 ms** | 2046 ms | 2000 |
+| `lastEventId`（属性） | 任何带 `id:` 的事件之后 | **下一次**连接会向服务端要哪个位点 | 什么都不用做——它是其余信号的地基 |
+| `hooks.gap`（`onSuspectGap`）——`{ reason, lastId, attempt }` | 每「一段」一次，当连续性**无法证明**时：`reconnect`（一次尝试结束）、`resume`（页面或网络恢复）、`rotate`（仅 `restart` 模式）、`drop`（单条消息超过 `maxBufferSize`）、`promote`（标签页接管） | 只能说「可能缺了」，永远说不出缺了什么 | 重拉快照，然后 `setResumePoint(snapshot.id)` |
+| `hooks.resume`（`onResume`）——`{ lastId, firstId, skipped, continuous }` | 带 `Last-Event-ID` 的请求发出后，第一条带 id 的事件 | 服务端到底接上了没有、跳了多远；id 不透明时 `skipped` 与 `continuous` 都是 `undefined` | 埋点与日志；`continuous === false` 说明真有洞 |
+| `setResumePoint(id)` | 你主动调用 | 下一次连接要哪个位点 | 修完缺口后立刻用快照 id 调它 |
 
-总工作量不变（切片不省时间），但最长阻塞降到 1/12。注意残余的 ~117ms 不是切片粒度造成的——把
-`yieldEvery` 调到 5 也是 117ms：2 秒的总积压会持续压住渲染，切片只能保证"没有单次超长任务"。
-要彻底不卡，得减少每条的渲染成本或做批量合并（见上面的 `createBatcher`）。
+两条规矩把它们分开：
 
-### 轮转与重连的区别
+- **`hooks.gap` 决定「做什么」，`hooks.resume` 决定「记什么」。** 不要用 `continuous === false`
+  触发快照重拉：那个报告在新流的首条事件上才到，你会先画出新数据、再被快照覆盖。
+- **永远不要改写正在跑的流的续传位点。** `setResumePoint` 有意只作用于**下一次**连接；中途改
+  `Last-Event-ID` 只会让解析器错位，不会修好缺口。
 
-连接可能还活着，但服务端的订阅已经没了。轮转（`rotateInterval`）会按周期重连，
-以避开这类僵尸连接，同时保留 `lastEventId` 保证不丢事件：
-
-```ts
-new SSEClient({ url, rotateInterval: 30 * 60_000 });
-```
-
-这依赖服务端正确处理 `Last-Event-ID`。如果服务端不支持，或者完全不能接受空档，改用重叠轮换：
-
-```ts
-new SSEClient({ url, rotateInterval: 30 * 60_000, rotateMode: "overlap", rotateTimeout: 30_000 });
-```
-
-`overlap` 会在**当前连接继续推送的同时**请求替换连接，只有替换连接被接受后才切换：
-旧的 attempt 被中止，新的流从它已经缓冲好的位置继续读，因此既不会丢事件也不会重放。
-替换连接打不开（502、content-type 不对、超时）就丢弃并通过 `onError` 上报，
-**正在跑的那条连接不受影响**——定时轮转不会拿一条好连接去换一条坏连接。
-
-`restart`（默认）先关后开，对服务端更轻，且在有 `Last-Event-ID` 支持时同样安全。
+服务端不发 `id:` 时，续传这套故事根本不存在：没有位点可以让服务端「从这儿继续」，所以
+`hooks.gap`（除了本地丢数据的 `drop`）和 `hooks.resume` 都不会触发。静默丢数据的流是服务端
+契约问题，客户端没法糊过去。
 
 ## 底层构件
 
@@ -698,7 +499,7 @@ ring.into(reused); // 同样的顺序写进已有数组，不产生分配
 
 ## 设计说明
 
-- 不含业务逻辑：客户端不关心 token、store、toast 或路由，鉴权通过 `headers` 注入。
+- 不含业务逻辑：鉴权通过 `headers` 注入，token、store、路由都不进客户端。
 - 错误不会从回调里逃逸成异常：抛错的处理器被隔离，通过 `onHandlerError` 上报，
   数据流继续。
 - 关闭时始终清理定时器；连接循环只在客户端最终关闭时退出，因此挂起与恢复不会泄漏循环。
@@ -718,14 +519,7 @@ pnpm build        # dist/ + dist/package.json
 见 [demo/README.zh-CN.md](./demo/README.zh-CN.md)，命令为 `pnpm demo:server` / `pnpm demo:smoke` /
 `pnpm demo:matrix` / `pnpm demo:memory`。
 
-CI 在 Node 18、20、22 上跑完整流水线；覆盖率阈值与无浏览器冒烟只在 Node 20 上跑一次。
-
-发版：先补 CHANGELOG 条目、升版本号、打 tag，然后
-
-```bash
-git tag -a v0.1.4 -m "v0.1.4"
-pnpm publish:npm  # 构建并发布到 npmjs（access: public）
-```
+CI 见 `.github/workflows/ci.yml`。
 
 ## 许可证
 

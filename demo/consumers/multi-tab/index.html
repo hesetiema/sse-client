@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>消费示例 · 多标签页共享</title>
+    <style>
+      :root { color-scheme: dark; }
+      body { margin: 0; font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; background: #0f1115; color: #e6e9ef; }
+      header { display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; padding: 16px 20px; border-bottom: 1px solid #232733; }
+      h1 { margin: 0; font-size: 16px; }
+      .muted { color: #8b93a7; }
+      #role { padding: 2px 8px; border-radius: 999px; background: #232733; font-size: 12px; }
+      #role[data-role="leader"] { background: #123524; color: #7be0a3; }
+      #role[data-role="follower"] { background: #1d2b3a; color: #7fb3e0; }
+      #role[data-role="solo"] { background: #3a2d12; color: #f0c36b; }
+      main { padding: 8px 20px 24px; }
+      ul { list-style: none; margin: 0; padding: 0; }
+      li { padding: 6px 0; border-bottom: 1px solid #1b1f2a; font-variant-numeric: tabular-nums; }
+    </style>
+    <link rel="stylesheet" href="../shared/panel.css" />
+  </head>
+  <body>
+    <header>
+      <h1>多标签页共享</h1>
+      <span class="muted">再开一个标签页：一个 leader，其余 follower，只有一条连接</span>
+      <span id="role" data-role="pending">pending</span>
+      <span id="stats" class="muted"></span>
+    </header>
+    <div id="panel" class="panel"></div>
+    <main><ul id="list"></ul></main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

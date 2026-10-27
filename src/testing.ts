@@ -221,3 +221,17 @@ export function createMockSSEFetch(options: MockSSEOptions = {}): MockSSEFetch {
     lastBody: <T = unknown>() => calls[calls.length - 1]?.body as T | undefined,
   };
 }
+
+/**
+ * Internals of the shared-connection registry, for tests and teardown.
+ *
+ * They live on this entry rather than the package root: an application should
+ * not have to reason about a module-level registry, and `closeAllSharedSSEClients`
+ * in particular is a test-only hammer (it closes connections other consumers may
+ * still be using).
+ */
+export {
+  closeAllSharedSSEClients,
+  getSharedSSEClientCount,
+  getSharedSSEClients,
+} from "./share.js";

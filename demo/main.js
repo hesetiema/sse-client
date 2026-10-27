@@ -51,7 +51,7 @@ const I18N = {
     "log.networkHint": "is the demo server running? try pnpm demo:server",
     "log.unauthorizedHint": "token expired? tick 'Refresh token on 401' or click Connect again",
     "log.sampled": "log sampled: {n} events were not rendered (rate {rate}/s)",
-    "log.overflow": "oversized message dropped ({count} so far), the connection stays open",
+    "log.gap": "stream may not be continuous: {reason} (refetch a snapshot here)",
     "mem.title": "Memory sampler",
     "mem.rate": "rate",
     "mem.delta": "Δ heap",
@@ -99,7 +99,7 @@ const I18N = {
     "log.networkHint": "服务端没起来？先跑 pnpm demo:server",
     "log.unauthorizedHint": "token 过期了？勾选「401 时自动刷新 token」或再点一次「连接」",
     "log.sampled": "日志降采样：{n} 条事件未渲染（速率 {rate}/s）",
-    "log.overflow": "已丢弃超限消息（累计 {count} 条），连接保持",
+    "log.gap": "流可能不连续：{reason}（真实业务应在此重拉快照）",
     "mem.title": "内存采样",
     "mem.rate": "速率",
     "mem.delta": "堆变化",
@@ -574,40 +574,51 @@ function connect() {
 
   const options = {
     url: `${endpoint()}/subscribe?${params.toString()}`,
-    method: "POST",
-    body: { topics: ["alarm"], scenario },
-    // Re-evaluated on every (re)connect, which also proves a refreshed token is used.
-    headers: async () => ({ authorization: `Bearer ${await ensureToken()}` }),
-    parse: (raw) => JSON.parse(raw),
-    idleTimeout: Number($("idle").value) || 0,
-    rotateInterval: Number($("rotate").value) || 0,
-    yieldEvery: Number($("yieldEvery").value) || 0,
-    overflowPolicy: $("overflowDrop").checked ? "drop" : "close",
-    reconnectOnEnd: $("reconnectOnEnd").checked,
-    pauseWhenHidden: $("pauseHidden").checked,
-    endSignal: "[DONE]",
-    maxRetry: maxRetryRaw === "" ? Infinity : Number(maxRetryRaw),
-    onOpen: () => log("open", "open", t("log.open")),
-    onStatus: (status) => log("status", "status", status),
-    onError: (error, attempt) => {
-      metrics.errors += 1;
-      metrics.lastError = `${error.kind}${error.status ? ` ${error.status}` : ""} · ${error.message}`;
-      const head = `${error.kind}${error.status ? ` ${error.status}` : ""} · ${error.message}`;
-      // Raw errors do not say what to do next; the common cases get a one-line hint.
-      let hintText = "";
-      if (error.kind === "network") hintText = t("log.networkHint");
-      else if (error.status === 401) hintText = t("log.unauthorizedHint");
-      log("error", `error #${attempt}`, hintText ? `${head} · ${hintText}` : head);
+    request: {
+      method: "POST",
+      body: { topics: ["alarm"], scenario },
+      // Re-evaluated on every (re)connect, which also proves a refreshed token is used.
+      headers: async () => ({ authorization: `Bearer ${await ensureToken()}` }),
     },
-    onClose: (reason, error) => log("close", "close", error ? `${reason} · ${error.message}` : reason),
-    onOverflow: (dropped) => log("system", "overflow", t("log.overflow", { count: dropped })),
-    onMessage: (message) => {
-      eventCount += 1;
-      metrics.bytes += message.raw?.length ?? 0;
-      $("count").textContent = String(eventCount);
-      if (handlerMs > 0) busyWait(handlerMs);
-      if (!allowLogRow()) return;
-      log("msg", message.event, `id=${message.id || "-"} ${preview(message.data)}`);
+    parse: (raw) => JSON.parse(raw),
+    stream: {
+      idleTimeout: Number($("idle").value) || 0,
+      rotate: Number($("rotate").value) || 0,
+      reconnectOnEnd: $("reconnectOnEnd").checked,
+      pauseWhenHidden: $("pauseHidden").checked,
+      endSignal: "[DONE]",
+    },
+    limits: {
+      yieldEvery: Number($("yieldEvery").value) || 0,
+      overflowPolicy: $("overflowDrop").checked ? "drop" : "close",
+    },
+    retry: { max: maxRetryRaw === "" ? Infinity : Number(maxRetryRaw) },
+    hooks: {
+      open: () => log("open", "open", t("log.open")),
+      status: (status) => log("status", "status", status),
+      error: (error, attempt) => {
+        metrics.errors += 1;
+        metrics.lastError = `${error.kind}${error.status ? ` ${error.status}` : ""} · ${error.message}`;
+        const head = `${error.kind}${error.status ? ` ${error.status}` : ""} · ${error.message}`;
+        // Raw errors do not say what to do next; the common cases get a one-line hint.
+        let hintText = "";
+        if (error.kind === "network") hintText = t("log.networkHint");
+        else if (error.status === 401) hintText = t("log.unauthorizedHint");
+        log("error", `error #${attempt}`, hintText ? `${head} · ${hintText}` : head);
+      },
+      close: (reason, error) => log("close", "close", error ? `${reason} · ${error.message}` : reason),
+      // Every drop, rotation or reconnect lands here: the only signal that says
+      // "something may be missing", as opposed to "something failed".
+      gap: ({ reason, lastId }) =>
+        log("system", "gap", `${t("log.gap", { reason })}${lastId ? ` · lastId=${lastId}` : ""}`),
+      message: (message) => {
+        eventCount += 1;
+        metrics.bytes += message.raw?.length ?? 0;
+        $("count").textContent = String(eventCount);
+        if (handlerMs > 0) busyWait(handlerMs);
+        if (!allowLogRow()) return;
+        log("msg", message.event, `id=${message.id || "-"} ${preview(message.data)}`);
+      },
     },
   };
 

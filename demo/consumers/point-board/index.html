@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>消费示例 · 测点看板</title>
+    <style>
+      :root { color-scheme: dark; }
+      body { margin: 0; font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; background: #0f1115; color: #e6e9ef; }
+      header { display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; padding: 16px 20px; border-bottom: 1px solid #232733; }
+      h1 { margin: 0; font-size: 16px; }
+      .muted { color: #8b93a7; }
+      #status { padding: 2px 8px; border-radius: 999px; background: #232733; font-size: 12px; }
+      #status[data-status="open"] { background: #123524; color: #7be0a3; }
+      #status[data-status="reconnecting"] { background: #3a2d12; color: #f0c36b; }
+      main { padding: 12px 20px 24px; display: grid; gap: 16px; }
+      canvas { width: 100%; height: 180px; background: #12151c; border: 1px solid #232733; border-radius: 8px; }
+      table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+      th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #1b1f2a; }
+      th { color: #8b93a7; font-weight: 500; }
+    </style>
+    <link rel="stylesheet" href="../shared/panel.css" />
+  </head>
+  <body>
+    <header>
+      <h1>测点看板</h1>
+      <span class="muted">fanout · 300ms 合并 · 2000 点环形缓冲 · 每帧一次重绘</span>
+      <span id="status" data-status="idle">idle</span>
+      <span id="stats" class="muted"></span>
+    </header>
+    <div id="panel" class="panel"></div>
+    <main>
+      <canvas id="chart" width="900" height="180"></canvas>
+      <table>
+        <thead><tr><th>设备</th><th>序号</th><th>到达时间</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

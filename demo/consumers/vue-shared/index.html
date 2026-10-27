@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>消费示例 · Vue 共享订阅</title>
+    <style>
+      :root { color-scheme: dark; }
+      body { margin: 0; font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; background: #0f1115; color: #e6e9ef; }
+      header { display: flex; flex-wrap: wrap; gap: 10px; align-items: baseline; padding: 16px 20px; border-bottom: 1px solid #232733; }
+      h1 { margin: 0; font-size: 16px; }
+      .muted { color: #8b93a7; }
+      button { background: #1b1f2a; color: #e6e9ef; border: 1px solid #2b3140; border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+      button.active { background: #1d2b3a; border-color: #3d6a96; color: #7fb3e0; }
+      .chip { padding: 2px 8px; border-radius: 999px; background: #232733; font-size: 12px; }
+      .chip[data-status="open"] { background: #123524; color: #7be0a3; }
+      .chip[data-status="reconnecting"] { background: #3a2d12; color: #f0c36b; }
+      ul { list-style: none; margin: 0; padding: 8px 20px 24px; }
+      li { padding: 6px 0; border-bottom: 1px solid #1b1f2a; font-variant-numeric: tabular-nums; }
+    </style>
+    <script type="importmap">
+      { "imports": { "vue": "/node_modules/vue/dist/vue.esm-browser.prod.js" } }
+    </script>
+    <link rel="stylesheet" href="../shared/panel.css" />
+  </head>
+  <body>
+    <!-- 面板放在 #app 之外：Vue 挂载会清空容器内容 -->
+    <div id="panel" class="panel"></div>
+    <div id="app">
+      <header>
+        <h1>Vue 共享订阅</h1>
+        <span class="muted">切租户 = 换共享 key，多组件复用同一条连接</span>
+        <button v-for="t in tenants" :key="t" @click="tenant = t" :class="{ active: tenant === t }">{{ t }}</button>
+        <span class="chip" :data-status="status">{{ status }}</span>
+        <span class="muted">key {{ key || "—" }} · 收到 {{ count }} 条</span>
+      </header>
+      <ul>
+        <li v-for="row in rows" :key="row.seq">#{{ row.seq }} · {{ row.deviceName }} · {{ row.level }}</li>
+      </ul>
+    </div>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
