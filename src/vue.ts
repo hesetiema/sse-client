@@ -15,6 +15,15 @@ export interface UseSSEOptions extends SSEClientOptions {
    * grace period. Defaults to false — one connection per `useSSE` call.
    */
   shared?: boolean | SharedSSEClientConfig;
+  /**
+   * Readiness gate: while it returns false nothing is requested; when it turns
+   * true the subscription starts, when it turns false the connection stops.
+   *
+   * This is what keeps a detail page from opening a throwaway subscription while
+   * the route params / instance id are still loading:
+   * `when: () => !!floorId.value`. Reactive values read inside are tracked.
+   */
+  when?: () => boolean;
 }
 
 /** Return value of `useSSE`. */
@@ -86,10 +95,10 @@ export interface UseSSEReturn<E extends object = SSEEventMap> {
 export function useSSE<E extends object = SSEEventMap>(
   options: UseSSEOptions,
 ): UseSSEReturn<E> {
-  const { immediate = true, shared = false, ...clientOptions } = options;
+  const { immediate = true, shared = false, when, ...clientOptions } = options;
 
   if (shared) {
-    return useSharedSSEImpl<E>(clientOptions, shared, immediate);
+    return useSharedSSEImpl<E>(clientOptions, shared, immediate, when);
   }
 
   const status = ref<SSEStatus>("idle");
@@ -144,11 +153,14 @@ export function useSSE<E extends object = SSEEventMap>(
     client.restart();
   };
 
+  let stopGate: (() => void) | null = null;
   const dispose = () => {
     if (disposed) {
       return;
     }
     disposed = true;
+    stopGate?.();
+    stopGate = null;
     for (const off of [...offs]) {
       off();
     }
@@ -156,7 +168,22 @@ export function useSSE<E extends object = SSEEventMap>(
     client.close();
   };
 
-  if (immediate) {
+  if (when) {
+    // `watchEffect` also runs immediately, so a ready gate opens on setup and a
+    // closed gate never issues a request at all.
+    const watcher: unknown = watchEffect(() => {
+      if (when()) {
+        start();
+      } else if (client.status !== "idle") {
+        // A gate that never opened must not look like a closed stream: `close()` is
+        // terminal for the client, this pause is not. Same status the shared
+        // flavour reports, so a template bound to `status` cannot tell them apart.
+        stop();
+        status.value = "idle";
+      }
+    });
+    stopGate = () => stopWatcher(watcher);
+  } else if (immediate) {
     start();
   }
 
@@ -184,6 +211,7 @@ function useSharedSSEImpl<E extends object>(
   options: SSEClientOptions,
   shared: true | SharedSSEClientConfig,
   immediate: boolean,
+  when?: () => boolean,
 ): UseSSEReturn<E> {
   const config: SharedSSEClientConfig = typeof shared === "object" ? shared : {};
   // `autoStart: false` keeps `immediate` in control and guarantees that the
@@ -262,11 +290,14 @@ function useSharedSSEImpl<E extends object>(
       handle.on(event, handler as (data: unknown, message: SSEMessage) => void),
     )) as SSEClient<E>["on"];
 
+  let stopGate: (() => void) | null = null;
   const dispose = () => {
     if (disposed) {
       return;
     }
     disposed = true;
+    stopGate?.();
+    stopGate = null;
     for (const off of [...offs]) {
       off();
     }
@@ -274,7 +305,20 @@ function useSharedSSEImpl<E extends object>(
     handle.release();
   };
 
-  if (immediate) {
+  if (when) {
+    const watcher: unknown = watchEffect(() => {
+      if (when()) {
+        if (!handle.configured) {
+          start();
+        }
+      } else {
+        handle.close();
+        syncClient();
+        status.value = handle.status;
+      }
+    });
+    stopGate = () => stopWatcher(watcher);
+  } else if (immediate) {
     start();
   } else {
     status.value = handle.status;
@@ -302,6 +346,12 @@ export interface UseSharedSSEOptions extends SharedSSEClientConfig {
    * Return `null` or `undefined` to stop consuming.
    */
   subscription?: () => SSEClientOptions | null | undefined;
+  /**
+   * Readiness gate for `subscription`: while it returns false nothing is
+   * consumed, and the current reference is released. Turning it back on re-applies
+   * `subscription()`.
+   */
+  when?: () => boolean;
 }
 
 /** Return value of `useSharedSSE`. */
@@ -351,7 +401,7 @@ export interface UseSharedSSEReturn<E extends object = SSEEventMap> {
 export function useSharedSSE<E extends object = SSEEventMap>(
   options: UseSharedSSEOptions = {},
 ): UseSharedSSEReturn<E> {
-  const { subscription, ...config } = options;
+  const { subscription, when, ...config } = options;
   const handle = useSharedSSEClient<E>(config);
 
   const status = ref<SSEStatus>(handle.status);
@@ -405,11 +455,18 @@ export function useSharedSSE<E extends object = SSEEventMap>(
     )) as SSEClient<E>["on"];
 
   let stopSubscription: (() => void) | null = null;
-  if (subscription) {
+  if (subscription || when) {
     // `watchEffect` also runs immediately, so the first subscription is applied
     // during setup, before the component renders.
     const watcher: unknown = watchEffect(() => {
-      configure(subscription());
+      // Gate first: an unready subscription must not open a throwaway connection.
+      if (when && !when()) {
+        configure(null);
+        return;
+      }
+      if (subscription) {
+        configure(subscription());
+      }
     });
     stopSubscription = () => stopWatcher(watcher);
   }
@@ -419,7 +476,7 @@ export function useSharedSSE<E extends object = SSEEventMap>(
       return;
     }
     error.value = null;
-    if (!handle.configured && subscription) {
+    if (!handle.configured && subscription && (!when || when())) {
       configure(subscription());
     }
     handle.client?.start();

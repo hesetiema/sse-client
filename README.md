@@ -140,6 +140,25 @@ Pass `shared: true` (or `{ grace, keyOf }`) to put every component describing th
 subscription on one connection: releases are reference counted, so one unmount no longer
 cuts the others off.
 
+Add `when` when the subscription target is not known yet. While it returns false no
+request is issued, so a detail page no longer opens a throwaway subscription for
+"no instance" and immediately replaces it:
+
+```ts
+const instanceId = ref<string>();
+const { status } = useSSE({
+  url: "/api/push",
+  when: () => !!instanceId.value,
+  body: () => [{ instanceId: instanceId.value }],
+});
+```
+
+Both `when` and a `body` factory are re-read reactively: `useSharedSSE`'s
+`subscription` getter, `useSSE`'s `when`, and any refs they touch. `when` wins over
+`immediate` — a gate that is still shut issues no request at all — and while it stays
+shut the reported status is `idle`, not `closed`: the stream has not ended, it has not
+started.
+
 ## API
 
 ### `new SSEClient(options)`
@@ -148,7 +167,9 @@ cuts the others off.
 | --- | --- | --- | --- |
 | `url` | `string` | — | Request URL, including your gateway prefix |
 | `method` | `"GET" \| "POST"` | `"POST"` | HTTP method |
-| `body` | `unknown` | — | Serialized as JSON; strings, `Blob` and `FormData` are sent as-is |
+| `body` | `unknown \| (() => unknown)` | — | Serialized as JSON; strings, `Blob` and `FormData` are sent as-is. A function is re-evaluated before every (re)connect, so filters can follow reactive state. Keep it pure: `deriveShareKey` resolves it too |
+| `credentials` | `RequestCredentials` | `"same-origin"` | Use `"include"` when the SSE endpoint is on another origin and auth rides on cookies |
+| `flags` | `string[]` | — | Valueless query flags appended to the URL: `["GRID_MAP"]` → `.../subscribe?GRID_MAP`. Part of the share key |
 | `headers` | `HeadersInit \| () => HeadersInit \| Promise<HeadersInit>` | — | Pass a function to recompute headers on every (re)connect |
 | `parse` | `(raw: string) => unknown` | identity | Payload decoder; `jsonParse` from the package keeps the raw text when a frame is not JSON |
 | `resumeFrom` | `string` | — | Resume point for the first request, sent as `Last-Event-ID`; use it to continue where a previous page load stopped |
@@ -189,6 +210,7 @@ equivalent.
 | `closed` | `boolean` | Terminal state; the client will not reconnect |
 | `attempts` | `number` | Consecutive retries; resets after a stable connection |
 | `lastEventId` | `string` | Latest event id, sent back on reconnect |
+| `url` | `string` | The URL actually requested, `flags` already applied |
 | `dropped` | `number` | Messages discarded by the cap (only grows with `overflowPolicy: "drop"`) |
 | `done` | `Promise<void>` | Resolves when the connection terminates; never rejects |
 
@@ -204,6 +226,8 @@ equivalent.
 | `on("*", handler)` | Subscribe to every message |
 | `once(event, handler)` | Subscribe for a single delivery |
 | `onMessage` / `onStatus` / `onError` / `onOpen` / `onClose` / `onOverflow` / `onSuspectGap` / `onResume` | Lifecycle subscriptions |
+| `fanout()` | One `"*"` subscription, many consumers, plus a latest-value snapshot per event (memoised) |
+| `use(plugin)` | Attach a plugin; a returned function runs once on close |
 
 `start()` also queues itself when a `close()` has not finished unwinding yet, so
 `stop(); start();` in the same tick reconnects instead of doing nothing.
@@ -250,8 +274,8 @@ the moment the subscription moves.
 Four things that surprise people:
 
 - **Same body, different `parse` collapse into one connection.** The key only covers
-  `url` / `method` / `body` / `events`, and the *first* caller's `parse` wins — the second
-  consumer receives whatever it returns. Pass `keyOf` to separate them.
+  `url` / `method` / `body` / `events` / `flags`, and the *first* caller's `parse` wins —
+  the second consumer receives whatever it returns. Pass `keyOf` to separate them.
 - **Switching is not grace-protected.** `F1 → F2 → F1` is two reconnects. Debounce the
   switch, or bucket the filter into the key (round the time range to a minute) instead of
   letting a slider produce a new key per pixel.
@@ -269,8 +293,9 @@ listener bookkeeping. Use a plain `SSEClient` for a single consumer, and
 
 ### `deriveShareKey(options)`
 
-Stable key from `url`, `method`, `body` and `events`; object keys are sorted and arrays
-are compared as sets. Exposed so an explicit `key` can follow the same rules.
+Stable key from `url`, `method`, `body`, `events` and `flags`; object keys are sorted and
+arrays are compared as sets. A `body` factory is resolved first, so changed filters mean a
+different key. Exposed so an explicit `key` can follow the same rules.
 
 ### `SSEMessage`
 
@@ -442,9 +467,9 @@ onUnmounted(() => sse.release());            // refcount, not a hard close
 ```
 
 All three components land on one connection because the key is derived from the
-subscription itself (`url`, `method`, `body`, `events`; arrays compared as sets) — they
-never have to agree on a string. Switching the floor moves all of them together and closes
-the old connection only once the last one has moved off it.
+subscription itself (`url`, `method`, `body`, `events`, `flags`; arrays compared as sets) —
+they never have to agree on a string. Switching the floor moves all of them together and
+closes the old connection only once the last one has moved off it.
 
 The behaviour table, `close()` versus `release()`, and the traps (a shared `parse`, no
 grace when switching) live in [`useSharedSSEClient`](#usesharedsseclientconfig).
@@ -471,6 +496,60 @@ Without Web Locks or `BroadcastChannel` every tab reports `solo` and connects on
 a degraded but honest fallback, rather than a hand-rolled protocol that can split-brain.
 `parse` must return structured-cloneable data, and `onOpen` fires on the leader only,
 because a `Response` cannot be relayed.
+
+### Fan-out: many consumers, one connection
+
+`on("*")` works, but every consumer then pays for its own wildcard handler and
+nobody remembers the last payload. `fanout()` gives one subscription and a
+snapshot per event, so a component that mounts late can render immediately:
+
+```ts
+const feed = client.fanout();
+
+feed.on("IOT_DATA_CHANGE", applyPoint);   // each consumer has its own unsubscribe
+feed.on("ABNORMAL_EVENT", pushAlarm);
+
+feed.latest("IOT_DATA_CHANGE");           // most recent payload, or undefined
+feed.count("IOT_DATA_CHANGE");            // how many consumers are listening
+```
+
+A throwing consumer is reported through `onHandlerError` and does not affect the
+others. `dispose()` drops every consumer and the source subscription; the
+snapshot stays readable until then.
+
+### Testing without a server
+
+The client only needs `fetch`, so the package ships a fake one. Reconnects,
+resume, hung gateways and rotation can all be reproduced in-process:
+
+```ts
+import { SSEClient } from "@songfreedom/sse-client";
+import { createMockSSEFetch } from "@songfreedom/sse-client/testing";
+
+const mock = createMockSSEFetch({
+  script: attempt =>
+    attempt === 0
+      ? [{ id: "1", event: "ALARM", data: { level: "high" } }]
+      : [{ id: "2", event: "ALARM", data: { level: "low" } }],
+});
+
+const client = new SSEClient({
+  url: "/push",
+  body: { topics: ["alarm"] },
+  fetch: mock.fetch,
+  parse: JSON.parse,
+  maxRetry: 1,          // one reconnect after the script ends, so `done` settles
+  retryBaseDelay: 0,
+});
+client.on("ALARM", handler);
+await client.done;
+
+expect(mock.calls[1].headers.get("last-event-id")).toBe("1");
+expect(mock.lastBody()).toEqual({ topics: ["alarm"] });
+```
+
+`keepOpen` models a live subscription, `hang` models a stalled gateway, and
+`script` receives the attempt index so a reconnect can return different data.
 
 ### Large lists and charts: compose the view window
 

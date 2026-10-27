@@ -1,4 +1,5 @@
 import { SSEError, isRetryableStatus, toSSEError } from "./errors.js";
+import { createFanout, type SseFanout } from "./fanout.js";
 import {
   DEFAULT_MAX_BUFFER_SIZE,
   createSSEParser,
@@ -27,6 +28,14 @@ import type {
 /** Same shape as `fetch`; inject a custom transport for SSR, tests or signed requests. */
 export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
 
+/**
+ * A plugin attaches cross-cutting behaviour to a client — metrics, logging,
+ * tracing, gap accounting — without every caller rebuilding the same wrapper.
+ *
+ * The return value, when it is a function, runs once when the client closes.
+ */
+export type SsePlugin<E extends object = SSEEventMap> = (client: SSEClient<E>) => void | Unsubscribe;
+
 /** Context passed to a retry policy. */
 export interface RetryContext {
   /** Retry number, starting at 1. */
@@ -53,8 +62,28 @@ export interface SSEClientOptions {
   url: string;
   /** HTTP method; business push endpoints usually use POST. */
   method?: "GET" | "POST";
-  /** Request body. Serialized as JSON, or passed through when it is a string / Blob / FormData. */
+  /**
+   * Request body. Serialized as JSON, or passed through when it is a string / Blob / FormData.
+   *
+   * Pass a function to recompute the body before every (re)connect — the same
+   * contract `headers` has. This is how a subscription follows reactive filters
+   * or instance ids without rebuilding the client:
+   * `body: () => [{ floorId: floor.value }]`.
+   */
   body?: unknown;
+  /**
+   * `credentials` for the fetch call, defaults to `"same-origin"`.
+   * Use `"include"` when the SSE endpoint lives on another origin and
+   * authentication rides on cookies.
+   */
+  credentials?: RequestCredentials;
+  /**
+   * Valueless query flags appended to the URL: `["GRID_MAP"]` becomes
+   * `.../subscribe?GRID_MAP`. Common for gateways that switch payload shape on a
+   * bare flag. They are part of the share key, so two flag sets never share a
+   * connection by accident.
+   */
+  flags?: string[];
   /**
    * Extra headers. Pass a function to recompute them before every (re)connect,
    * which is the recommended way to pick up a refreshed token:
@@ -209,6 +238,11 @@ export class SSEClient<E extends object = SSEEventMap> {
   private readonly options: SSEClientOptions;
   private readonly parser: SSEParser;
   private readonly eventFilter: Set<string> | null;
+  /** `url` with `flags` applied; the raw option is kept untouched for share keys. */
+  private readonly requestUrl: string;
+  /** Memoised so repeated `fanout()` calls share one `"*"` subscription. */
+  private fanoutInstance: SseFanout | null = null;
+  private readonly pluginTeardowns = new Set<Unsubscribe>();
 
   private state: SSEStatus = "idle";
   private finished = false;
@@ -269,10 +303,11 @@ export class SSEClient<E extends object = SSEEventMap> {
       throw new Error("[sse-client] missing required option: url");
     }
     this.options = options;
+    this.requestUrl = appendFlags(options.url, options.flags);
     this.persistKey = options.persistKey
       ? typeof options.persistKey === "string"
         ? options.persistKey
-        : deriveResumeKey({ url: options.url, method: options.method, body: options.body })
+        : deriveResumeKey({ url: options.url, method: options.method, body: resolveBodyOption(options.body) })
       : null;
     this.persistStorage = this.persistKey
       ? resolveResumeStorage(options.persistStorage)
@@ -320,6 +355,11 @@ export class SSEClient<E extends object = SSEEventMap> {
   /** Latest event id, sent back as `Last-Event-ID` on reconnect. */
   get lastEventId(): string {
     return this.lastEventIdValue;
+  }
+
+  /** URL the client actually requests, `flags` already applied. */
+  get url(): string {
+    return this.requestUrl;
   }
 
   /** Messages discarded under `overflowPolicy: "drop"` so far. */
@@ -486,6 +526,46 @@ export class SSEClient<E extends object = SSEEventMap> {
     return subscribe(this.resumeHandlers, handler);
   }
 
+  /**
+   * Fan-out view over this connection: one `"*"` subscription, many consumers,
+   * each with its own unsubscribe, plus a latest-value snapshot per event.
+   *
+   * ```ts
+   * const feed = client.fanout();
+   * feed.on("IOT_DATA_CHANGE", apply);
+   * feed.latest("IOT_DATA_CHANGE"); // -> most recent payload
+   * ```
+   *
+   * Memoised: repeated calls return the same instance.
+   */
+  fanout(): SseFanout {
+    this.fanoutInstance ??= createFanout(
+      { on: (event, handler) => this.on(event, handler) },
+      { onHandlerError: this.options.onHandlerError },
+    );
+    return this.fanoutInstance;
+  }
+
+  /**
+   * Attach a plugin (metrics, logging, gap accounting). Runs immediately; a
+   * throwing plugin is reported and skipped so it cannot break the stream.
+   * A returned function runs once on close.
+   */
+  use(plugin: SsePlugin<E>): this {
+    if (this.finished) {
+      return this;
+    }
+    try {
+      const teardown = plugin(this);
+      if (typeof teardown === "function") {
+        this.pluginTeardowns.add(teardown);
+      }
+    } catch (error) {
+      this.reportPluginError(error, "setup");
+    }
+    return this;
+  }
+
   // ---------------------------------------------------------------------------
   // Internals
   // ---------------------------------------------------------------------------
@@ -631,17 +711,20 @@ export class SSEClient<E extends object = SSEEventMap> {
 
   /** Open one connection and validate it (throws on failure). */
   private async request(signal: AbortSignal): Promise<Response> {
-    const { url, method = "POST", body, fetch: fetchImpl } = this.options;
+    const { method = "POST", fetch: fetchImpl } = this.options;
+    // Recompute per attempt: a body factory is how filters/instance ids change
+    // without rebuilding the client.
+    const body = resolveBodyOption(this.options.body);
     const init: RequestInit = {
       method,
       headers: await this.resolveHeaders(),
       body: method === "GET" || body === undefined ? undefined : serializeBody(body),
       signal,
       cache: "no-store",
-      credentials: "same-origin",
+      credentials: this.options.credentials ?? "same-origin",
     };
 
-    const response = fetchImpl ? await fetchImpl(url, init) : await fetch(url, init);
+    const response = fetchImpl ? await fetchImpl(this.requestUrl, init) : await fetch(this.requestUrl, init);
 
     if (!response.ok) {
       throw new SSEError(`SSE request failed: HTTP ${response.status}`, {
@@ -919,6 +1002,18 @@ export class SSEClient<E extends object = SSEEventMap> {
       return;
     }
     console.error("[sse-client] a callback threw", error);
+  }
+
+  /**
+   * Plugin failures follow the same contract as a throwing handler: `onHandlerError`
+   * when the caller supplied one, `console.error` only as the last resort.
+   */
+  private reportPluginError(error: unknown, phase: "setup" | "teardown"): void {
+    if (this.options.onHandlerError) {
+      this.options.onHandlerError(error);
+      return;
+    }
+    console.error(`[sse-client] plugin ${phase} failed`, error);
   }
 
   private async decideDelay(context: RetryContext): Promise<number | false> {
@@ -1247,6 +1342,17 @@ export class SSEClient<E extends object = SSEEventMap> {
     this.resumeWaiter = null;
     this.setState("closed");
     this.emit(this.closeHandlers, reason, error);
+    // Release plugin resources: they would outlive the stream otherwise, which is
+    // exactly the leak plugins are supposed to prevent. The fan-out is left alone
+    // so consumers can still read `latest()` after the stream ended.
+    this.pluginTeardowns.forEach(teardown => {
+      try {
+        teardown();
+      } catch (error) {
+        this.reportPluginError(error, "teardown");
+      }
+    });
+    this.pluginTeardowns.clear();
   }
 }
 
@@ -1295,6 +1401,32 @@ function parseRetryAfter(value: string | null): number | undefined {
     return undefined;
   }
   return Math.max(0, at - Date.now());
+}
+
+/** Resolve a body factory; static values pass through untouched. */
+function resolveBodyOption(body: unknown): unknown {
+  return typeof body === "function" ? (body as () => unknown)() : body;
+}
+
+/**
+ * Append valueless query flags to a URL: `["GRID_MAP"]` → `...?GRID_MAP`.
+ * An existing query string is respected and the hash stays at the end.
+ */
+function appendFlags(url: string, flags?: string[]): string {
+  if (!flags?.length) {
+    return url;
+  }
+  const cleaned = flags
+    .map(flag => String(flag).replace(/^[?&]+/, "").trim())
+    .filter(Boolean);
+  if (!cleaned.length) {
+    return url;
+  }
+  const hashAt = url.indexOf("#");
+  const base = hashAt === -1 ? url : url.slice(0, hashAt);
+  const hash = hashAt === -1 ? "" : url.slice(hashAt);
+  const separator = base.includes("?") ? "&" : "?";
+  return `${base}${separator}${cleaned.join("&")}${hash}`;
 }
 
 /** Serialize the body: strings / Blob / FormData pass through, everything else becomes JSON. */

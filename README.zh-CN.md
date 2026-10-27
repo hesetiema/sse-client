@@ -135,6 +135,22 @@ const connected = computed(() => status.value === "open");
 加上 `shared: true`（或 `{ grace, keyOf }`）后，描述同一订阅的多个组件共用一条连接：
 释放按引用计数，某个组件卸载不会再顺带掐掉其它组件的连接。
 
+订阅目标还不确定时加 `when`。返回 false 期间一个请求都不发，详情页就不会先为「没有实例」
+开一条一次性订阅、紧接着又换掉：
+
+```ts
+const instanceId = ref<string>();
+const { status } = useSSE({
+  url: "/api/push",
+  when: () => !!instanceId.value,
+  body: () => [{ instanceId: instanceId.value }],
+});
+```
+
+`when` 与 `body` 工厂都会被响应式重读：`useSharedSSE` 的 `subscription` getter、`useSSE` 的
+`when`，以及它们读到的任何 ref，变化后都会重新求值。`when` 的优先级高于 `immediate`：门没开
+就一个请求都不发；门关着的时候上报的状态是 `idle` 而不是 `closed`——流不是结束了，是还没开始。
+
 ## API
 
 ### `new SSEClient(options)`
@@ -143,7 +159,9 @@ const connected = computed(() => status.value === "open");
 | --- | --- | --- | --- |
 | `url` | `string` | — | 请求地址，包含网关前缀 |
 | `method` | `"GET" \| "POST"` | `"POST"` | HTTP 方法 |
-| `body` | `unknown` | — | 序列化为 JSON；字符串、`Blob`、`FormData` 原样发送 |
+| `body` | `unknown \| (() => unknown)` | — | 序列化为 JSON；字符串、`Blob`、`FormData` 原样发送。传函数则每次（重）连前重新求值，可跟随响应式筛选条件。请保持纯函数：`deriveShareKey` 也会求值 |
+| `credentials` | `RequestCredentials` | `"same-origin"` | 订阅接口跨域且靠 cookie 鉴权时传 `"include"` |
+| `flags` | `string[]` | — | 拼在 URL 上的无值标记：`["GRID_MAP"]` → `.../subscribe?GRID_MAP`。参与共享 key |
 | `headers` | `HeadersInit \| () => HeadersInit \| Promise<HeadersInit>` | — | 传函数可在每次（重）连时重新计算请求头 |
 | `parse` | `(raw: string) => unknown` | 原样返回 | 载荷解码器；可用包内的 `jsonParse`，非 JSON 帧保留原文而不是丢弃 |
 | `resumeFrom` | `string` | — | 首次请求的续传位点，作为 `Last-Event-ID` 发送；用于从上次页面停留处继续 |
@@ -183,6 +201,7 @@ const connected = computed(() => status.value === "open");
 | `closed` | `boolean` | 终态；为 `true` 时不会再重连 |
 | `attempts` | `number` | 连续重试次数，连接稳定后重置 |
 | `lastEventId` | `string` | 最新事件 id，重连时会带回服务端 |
+| `url` | `string` | 实际请求的地址，`flags` 已拼接 |
 | `dropped` | `number` | 因超限被丢弃的消息数（`overflowPolicy: "drop"` 时才会增长） |
 | `done` | `Promise<void>` | 连接终止时兑现，永不 reject |
 
@@ -198,6 +217,8 @@ const connected = computed(() => status.value === "open");
 | `on("*", handler)` | 订阅所有消息 |
 | `once(event, handler)` | 只订阅一次投递 |
 | `onMessage` / `onStatus` / `onError` / `onOpen` / `onClose` / `onOverflow` / `onSuspectGap` / `onResume` | 生命周期订阅 |
+| `fanout()` | 一个 `"*"` 订阅派发给多个消费者，并为每个事件保留最新值（同一实例） |
+| `use(plugin)` | 挂载插件；插件返回的函数在连接关闭时执行一次 |
 
 `start()` 在 `close()` 尚未卸载完毕时会自我排队，因此同一 tick 里的 `stop(); start();`
 是真的重连，而不是什么都不做。
@@ -239,7 +260,7 @@ onScopeDispose(() => sse.release());
 
 四个容易踩的点：
 
-- **body 相同但 `parse` 不同会被合并**。key 只覆盖 `url` / `method` / `body` / `events`，
+- **body 相同但 `parse` 不同会被合并**。key 只覆盖 `url` / `method` / `body` / `events` / `flags`，
   而且**先创建的那个 `parse` 获胜**——第二个使用方拿到的是它的返回值。需要区分就传 `keyOf`。
 - **切换不受 grace 保护**。`F1 → F2 → F1` 就是两次重连。要么 debounce 切换，要么把筛选
   条件分桶进 key（时间范围取整到分钟），别让滑块每一像素产生一个新 key。
@@ -254,8 +275,9 @@ onScopeDispose(() => sse.release());
 
 ### `deriveShareKey(options)`
 
-由 `url`、`method`、`body`、`events` 生成稳定 key：对象键排序，数组按集合比较。
-导出它，是为了手写 `key` 时能沿用同一套规则。
+由 `url`、`method`、`body`、`events`、`flags` 生成稳定 key：对象键排序，数组按集合比较。
+`body` 传函数时会先求值再入 key，因此筛选条件变化就是换 key。导出它，是为了手写 `key`
+时能沿用同一套规则。
 
 ### `SSEMessage`
 
@@ -407,6 +429,24 @@ leader 标签页关闭后，排队中的 follower 接管锁，并从它最后看
 每个标签页都报告 `solo` 并各自连接：这是降级但诚实的行为，好过一个可能脑裂的自研协议。
 `parse` 必须返回可结构化克隆的数据；`onOpen` 只在 leader 上触发，因为 `Response` 无法中继。
 
+### 一个连接，多个消费者
+
+`on("*")` 也能用，但每个消费者各自付一份通配符处理成本，而且没人记得上一条载荷。
+`fanout()` 给出一条订阅，外加每个事件的最新快照，晚挂载的组件可以立刻渲染而不是等下一次推送：
+
+```ts
+const feed = client.fanout();
+
+feed.on("IOT_DATA_CHANGE", applyPoint);   // 每个消费者各有自己的取消订阅
+feed.on("ABNORMAL_EVENT", pushAlarm);
+
+feed.latest("IOT_DATA_CHANGE");           // 最近一次载荷，没有则 undefined
+feed.count("IOT_DATA_CHANGE");            // 有多少消费者在监听
+```
+
+某个消费者抛错会经 `onHandlerError` 上报，不影响其它人。`dispose()` 丢掉全部消费者与源订阅；
+在那之前快照一直可读。
+
 ### 共用一条连接
 
 HTTP/1.1 同源最多 6 条连接，而一个推送通道会长期占住其中一条。
@@ -440,12 +480,46 @@ onUnmounted(() => sse.release());            // 引用计数，而不是直接�
 </script>
 ```
 
-三个组件落到同一条连接上，是因为 key 由订阅自身推导（`url`、`method`、`body`、`events`，
-数组按集合比较）——它们不需要事先约定一个字符串。切换楼层时三者一起搬走，旧连接只有在
-最后一个使用方也离开后才关闭。
+三个组件落到同一条连接上，是因为 key 由订阅自身推导（`url`、`method`、`body`、`events`、
+`flags`，数组按集合比较）——它们不需要事先约定一个字符串。切换楼层时三者一起搬走，旧连接
+只有在最后一个使用方也离开后才关闭。
 
 行为对照表、`close()` 与 `release()` 的区别、以及那些坑（共享 `parse`、切换不享受 grace）
 都在 [`useSharedSSEClient`](#usesharedsseclientconfig)。
+
+### 不用服务端的测试
+
+客户端只依赖 `fetch`，所以包里自带一个假的。重连、续传、卡死的网关、轮转都能在进程内
+确定性地复现，Node 与浏览器 runner 都一样：
+
+```ts
+import { SSEClient } from "@songfreedom/sse-client";
+import { createMockSSEFetch } from "@songfreedom/sse-client/testing";
+
+const mock = createMockSSEFetch({
+  script: attempt =>
+    attempt === 0
+      ? [{ id: "1", event: "ALARM", data: { level: "high" } }]
+      : [{ id: "2", event: "ALARM", data: { level: "low" } }],
+});
+
+const client = new SSEClient({
+  url: "/push",
+  body: { topics: ["alarm"] },
+  fetch: mock.fetch,
+  parse: JSON.parse,
+  maxRetry: 1,        // 脚本跑完重连一次就收工，`done` 才会兑现
+  retryBaseDelay: 0,
+});
+client.on("ALARM", handler);
+await client.done;
+
+expect(mock.calls[1].headers.get("last-event-id")).toBe("1");
+expect(mock.lastBody()).toEqual({ topics: ["alarm"] });
+```
+
+`keepOpen` 模拟持续订阅，`hang` 模拟迟迟不响应的网关，`script` 收到的参数是第几次尝试，
+因此重连可以返回不同的数据。
 
 ### 大列表与图表：视图窗口自己组合
 

@@ -1,5 +1,8 @@
 export { SSEClient } from "./client.js";
-export type { FetchLike, RetryContext, RetryPolicy, SSEClientOptions } from "./client.js";
+export type { FetchLike, RetryContext, RetryPolicy, SSEClientOptions, SsePlugin } from "./client.js";
+
+export { createFanout } from "./fanout.js";
+export type { SseEventHandler, SseFanout, SseFanoutOptions, SseFanoutSource } from "./fanout.js";
 
 export { SSEError, isRetryableStatus, toSSEError } from "./errors.js";
 

@@ -4,7 +4,40 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.4] — unreleased
+## [Unreleased]
+
+### Added
+
+- `client.fanout()`: one `"*"` subscription behind many consumers, each with its own
+  unsubscribe, plus a latest-payload snapshot per event name.
+- `client.use(plugin)`: cross-cutting behaviour (metrics, logging, gap accounting) attached
+  once; a returned function runs on close.
+- `body` accepts a factory, re-evaluated before every (re)connect, so a subscription can
+  follow reactive filters without rebuilding the client.
+- `credentials` (defaults to `"same-origin"`) and `flags` (valueless query flags such as
+  `["GRID_MAP"]`, appended without disturbing an existing query string or hash).
+- Readiness gate `when` for `useSSE` / `useSharedSSE`: no request is issued while it
+  returns false, and the connection is released when it shuts.
+- `@songfreedom/sse-client/testing`: `createMockSSEFetch` drives reconnects, resume, hung
+  gateways and rotation in-process, without a server or a test runner dependency.
+
+### Changed
+
+- `deriveShareKey` folds `flags` into the key and resolves a `body` factory, so two flag
+  sets or two filter values never share a connection by accident.
+- A plugin that throws is reported through `onHandlerError` like any other callback;
+  `console.error` remains the fallback when no handler is configured.
+- `useSSE({ when })` reports `idle` while the gate is shut instead of `closed`, matching
+  the shared flavour — a pause is not the end of the stream.
+
+### Fixed
+
+- The mock wrote a multi-line payload as one `data:` line, ending the field early and
+  dropping the rest.
+- The mock lost custom headers when they were passed as a `Headers` instance or tuples,
+  and kept a cancelled stream's controller alive.
+
+## [0.1.4] — 2026-10-27
 
 The release that turns "the connection came back" into "we know how much of the stream
 we still have".
@@ -82,7 +115,8 @@ we still have".
   `Last-Event-ID` resume, idle watchdog, scheduled rotation, pluggable retry policy and
   the optional Vue 3 entry point.
 
-[0.1.4]: https://github.com/hesetiema/sse-client/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/hesetiema/sse-client/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/hesetiema/sse-client/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/hesetiema/sse-client/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/hesetiema/sse-client/compare/v0.1.0...v0.1.2
 [0.1.0]: https://github.com/hesetiema/sse-client/releases/tag/v0.1.0

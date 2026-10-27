@@ -73,20 +73,25 @@ const stringifyForKey = (value: unknown, sortArrays: boolean): string => {
  * describe the same subscription land on the same connection without agreeing
  * on a hand-written key.
  *
- * Only what reaches the server (url, method, body) and what changes what a
- * consumer receives (event allow-list) is compared. Decoders and other
+ * Only what reaches the server (url, method, body, flags) and what changes what
+ * a consumer receives (event allow-list) is compared. Decoders and other
  * callbacks cannot be compared, so pass an explicit key when two consumers need
- * the same subscription parsed differently.
+ * the same subscription parsed differently. A `body` factory is invoked once per
+ * call, so the key tracks whatever the factory currently reads.
  */
 export function deriveShareKey(options: SSEClientOptions, keyOptions: KeyOptions = {}): string {
   const sortArrays = keyOptions.sortArrays ?? true;
+  // A body factory is resolved here as well: `configure()` runs when the reactive
+  // source changes, so the key follows filters and instance ids.
+  const body = typeof options.body === "function" ? (options.body as () => unknown)() : options.body;
   return hashKey(
     stringifyForKey(
       {
         url: options.url,
         method: options.method ?? "POST",
-        body: options.body ?? null,
+        body: body ?? null,
         events: options.events ?? null,
+        flags: options.flags ?? null,
       },
       sortArrays,
     ),
