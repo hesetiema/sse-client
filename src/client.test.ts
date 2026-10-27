@@ -289,6 +289,121 @@ describe("SSEClient transport", () => {
   });
 });
 
+describe("SSEClient overlap rotation", () => {
+  it("takes the candidate over without an error and keeps reading it", async () => {
+    vi.useFakeTimers();
+    let callCount = 0;
+    const signals: (AbortSignal | null | undefined)[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init: RequestInit) => {
+        callCount += 1;
+        signals.push(init.signal);
+        return Promise.resolve(hangingResponse(init, [`data: msg-${callCount}\n\n`]));
+      }),
+    );
+    const received: SSEMessage[] = [];
+    const onError = vi.fn();
+
+    const client = new SSEClient({
+      url: "/s",
+      rotateInterval: 100,
+      rotateMode: "overlap",
+      onMessage: (message) => received.push(message),
+      onError,
+    });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(received.map((message) => message.data)).toEqual(["msg-1"]);
+
+    await vi.advanceTimersByTimeAsync(60);
+
+    expect(callCount).toBe(2);
+    // A handoff is not a failure: no error event, no backoff, no restart.
+    expect(onError).not.toHaveBeenCalled();
+    expect(client.status).toBe("open");
+    expect(signals[0]?.aborted).toBe(true);
+    expect(signals[1]?.aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(10);
+    expect(received.map((message) => message.data)).toEqual(["msg-1", "msg-2"]);
+
+    client.close();
+    await client.done;
+    expect(signals[1]?.aborted).toBe(true);
+  });
+
+  it("keeps streaming when the candidate cannot be opened", async () => {
+    vi.useFakeTimers();
+    let callCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init: RequestInit) => {
+        callCount += 1;
+        return Promise.resolve(
+          callCount === 1
+            ? hangingResponse(init, [`data: msg-1\n\n`])
+            : new Response("gateway error", { status: 502 }),
+        );
+      }),
+    );
+    const onError = vi.fn();
+
+    const client = new SSEClient({
+      url: "/s",
+      rotateInterval: 100,
+      rotateMode: "overlap",
+      onError,
+    });
+    await vi.advanceTimersByTimeAsync(120);
+
+    expect(callCount).toBe(2);
+    expect(onError).toHaveBeenCalledTimes(1);
+    // The running connection was not traded for a broken one.
+    expect(client.status).toBe("open");
+    expect(client.closed).toBe(false);
+
+    client.close();
+    await client.done;
+  });
+
+  it("gives up a hanging candidate after rotateTimeout and keeps streaming", async () => {
+    vi.useFakeTimers();
+    let callCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init: RequestInit) => {
+        callCount += 1;
+        if (callCount === 1) {
+          return Promise.resolve(hangingResponse(init, ["data: msg-1\n\n"]));
+        }
+        return new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () =>
+            reject(new DOMException("aborted", "AbortError")),
+          );
+        });
+      }),
+    );
+    const onError = vi.fn();
+
+    const client = new SSEClient({
+      url: "/s",
+      rotateInterval: 100,
+      rotateMode: "overlap",
+      rotateTimeout: 20,
+      onError,
+    });
+    await vi.advanceTimersByTimeAsync(150);
+
+    expect(callCount).toBe(2);
+    // Our own timeout is not reported as a connection error.
+    expect(onError).not.toHaveBeenCalled();
+    expect(client.status).toBe("open");
+
+    client.close();
+    await client.done;
+  });
+});
+
 describe("SSEClient extension points", () => {
   it("a custom retry policy overrides the built-in backoff (e.g. refresh the token after a 401)", async () => {
     vi.useFakeTimers();

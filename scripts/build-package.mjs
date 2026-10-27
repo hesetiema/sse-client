@@ -27,6 +27,7 @@ const published = {
   exports: {
     ".": { types: "./index.d.ts", default: "./index.js" },
     "./vue": { types: "./vue.d.ts", default: "./vue.js" },
+    "./multi-tab": { types: "./multi-tab.d.ts", default: "./multi-tab.js" },
   },
   peerDependencies: manifest.peerDependencies,
   peerDependenciesMeta: manifest.peerDependenciesMeta,

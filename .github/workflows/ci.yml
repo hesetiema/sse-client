@@ -8,6 +8,12 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    strategy:
+      # One failing runtime should not hide the other two.
+      fail-fast: false
+      matrix:
+        # `engines` says >=18, so 18 is the floor that has to keep working.
+        node: [18, 20, 22]
     steps:
       - uses: actions/checkout@v4
 
@@ -17,7 +23,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ matrix.node }}
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
@@ -25,3 +31,18 @@ jobs:
       - run: pnpm lint
       - run: pnpm test
       - run: pnpm build
+
+      # Coverage is a gate, not a matrix dimension: one report is enough and the
+      # numbers do not change per runtime.
+      - name: Coverage thresholds
+        if: matrix.node == 20
+        run: pnpm coverage
+
+      # Drives the built package against the dependency-free demo server. Nginx is
+      # absent here, so the gateway rows report "not running (skipped)".
+      - name: Demo smoke (headless)
+        if: matrix.node == 20
+        run: |
+          node demo/server.mjs &
+          sleep 2
+          pnpm demo:smoke

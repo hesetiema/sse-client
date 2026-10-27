@@ -6,7 +6,23 @@ import {
   type ParsedEvent,
   type SSEParser,
 } from "./parser.js";
-import type { SSECloseReason, SSEEventMap, SSEMessage, SSEStatus, Unsubscribe } from "./types.js";
+import {
+  deriveResumeKey,
+  readResumePoint,
+  resolveResumeStorage,
+  writeResumePoint,
+  type ResumeStorage,
+} from "./resume.js";
+import type {
+  SSECloseReason,
+  SSEEventMap,
+  SSEGapInfo,
+  SSEGapReason,
+  SSEMessage,
+  SSEResumeInfo,
+  SSEStatus,
+  Unsubscribe,
+} from "./types.js";
 
 /** Same shape as `fetch`; inject a custom transport for SSR, tests or signed requests. */
 export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
@@ -48,12 +64,41 @@ export interface SSEClientOptions {
   /** Payload decoder, e.g. `(raw) => JSON.parse(raw)`. Defaults to the raw string. */
   parse?: (raw: string) => unknown;
   /**
+   * Resume point for the very first request, sent as `Last-Event-ID`. Use it to
+   * continue where a previous page load stopped instead of starting fresh (which
+   * silently skips everything produced while the page was loading).
+   */
+  resumeFrom?: string;
+  /**
+   * Keep `lastEventId` across page loads. `true` derives a key from the
+   * subscription, a string is used as-is; without it the resume point lives in
+   * memory only and an F5 loses it.
+   *
+   * Writes are throttled to one per second and flushed on close and `pagehide`,
+   * so a fast stream does not turn into one synchronous storage write per message.
+   */
+  persistKey?: string | boolean;
+  /** Storage for `persistKey`; defaults to `sessionStorage`. Pass `null` to disable. */
+  persistStorage?: ResumeStorage | null;
+  /**
    * Idle timeout in milliseconds: reconnect when no bytes arrived for this long.
    * `0` disables it. Two to three times the server heartbeat interval is a good value.
    */
   idleTimeout?: number;
   /** Proactive rotation interval in milliseconds: reconnect on schedule to avoid zombie connections. `0` disables it. */
   rotateInterval?: number;
+  /**
+   * How `rotateInterval` is applied (default `"restart"`).
+   *
+   * - `restart`: close the current connection, then reopen it. Relies on `Last-Event-ID` to
+   *   resume; without server-side id support everything produced during the gap is lost.
+   * - `overlap`: open the candidate first and take it over as soon as it is accepted, so a
+   *   scheduled rotation never leaves a gap. A candidate that fails leaves the current
+   *   connection untouched instead of trading a working stream for a broken one.
+   */
+  rotateMode?: "restart" | "overlap";
+  /** How long to wait for the candidate before giving up on a rotation, defaults to 30000. */
+  rotateTimeout?: number;
   /** Custom retry policy, overrides the built-in backoff. */
   retry?: RetryPolicy;
   /** Maximum retry count, unlimited by default (only used when `retry` is not provided). */
@@ -122,11 +167,32 @@ export interface SSEClientOptions {
    * Receives the cumulative drop count for this client.
    */
   onOverflow?: (dropped: number) => void;
+  /**
+   * Fired when the stream may not be continuous — a reconnect, a resume after a
+   * hidden page or offline period, a `restart`-mode rotation, or a dropped
+   * message. The usual reaction is to refetch a snapshot and call
+   * `setResumePoint(snapshot.id)`; the client itself cannot tell what was missed.
+   *
+   * Fires at most once per episode: the flag resets when a connection opens
+   * again, so a long outage does not produce one report per retry.
+   */
+  onSuspectGap?: (info: SSEGapInfo) => void;
+  /**
+   * Fired once per connection, on the first event that carries an id after a
+   * request that sent `Last-Event-ID`. It answers the question `onSuspectGap`
+   * can only raise: *did* the server resume, and from where?
+   *
+   * `skipped` and `continuous` stay `undefined` when ids are not integers — the
+   * client refuses to guess an ordering it cannot know.
+   */
+  onResume?: (info: SSEResumeInfo) => void;
 }
 
 const EVENT_STREAM_CONTENT_TYPE = "text/event-stream";
 /** Prevents tight reconnect loops when the server drops the connection immediately. */
 const MIN_RETRY_DELAY = 200;
+/** At most one resume-point write per second, no matter how fast the stream is. */
+const PERSIST_THROTTLE = 1000;
 
 /**
  * Server-Sent Events client.
@@ -151,8 +217,21 @@ export class SSEClient<E extends object = SSEEventMap> {
   private attempt = 0;
   private lastEventIdValue = "";
   private serverRetryDelay: number | undefined;
+  /** Where `lastEventId` is persisted, `null` when persistence is off. */
+  private readonly persistKey: string | null;
+  private readonly persistStorage: ResumeStorage | null;
+  private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  private persistDirty = false;
+  private onPageHide?: () => void;
+  /** Resume point requested by `setResumePoint`, applied by the next request. */
+  private pendingResumePoint: string | null = null;
   private idleTimedOut = false;
   private rotating = false;
+  /** Overlap rotation: the candidate connection is accepted and waits for the loop to adopt it. */
+  private handedOver = false;
+  private probing = false;
+  private preparedAttempt: { response: Response; controller: AbortController } | null = null;
+  private probeController: AbortController | null = null;
   /** Set when `suspend()` aborts the attempt, so the abort is not read as an error. */
   private suspendAbort = false;
   /** Set by `restart()` while the old loop is still unwinding. */
@@ -175,14 +254,32 @@ export class SSEClient<E extends object = SSEEventMap> {
   private readonly openHandlers = new Set<(response: Response) => void>();
   private readonly closeHandlers = new Set<(reason: SSECloseReason, error?: SSEError) => void>();
   private readonly overflowHandlers = new Set<(dropped: number) => void>();
+  private readonly gapHandlers = new Set<(info: SSEGapInfo) => void>();
+  private readonly resumeHandlers = new Set<(info: SSEResumeInfo) => void>();
   /** Last reported drop count, so `onOverflow` fires once per drop instead of once per chunk. */
   private lastDropped = 0;
+  /** Set once a gap is reported; cleared when a connection opens again. */
+  private gapReported = false;
+  /** Set when a connection opens with a resume point, consumed by its first identified event. */
+  private resumeCheckPending = false;
+  private resumeCheckFrom = "";
 
   constructor(options: SSEClientOptions) {
     if (!options?.url) {
       throw new Error("[sse-client] missing required option: url");
     }
     this.options = options;
+    this.persistKey = options.persistKey
+      ? typeof options.persistKey === "string"
+        ? options.persistKey
+        : deriveResumeKey({ url: options.url, method: options.method, body: options.body })
+      : null;
+    this.persistStorage = this.persistKey
+      ? resolveResumeStorage(options.persistStorage)
+      : null;
+    // An explicit `resumeFrom` wins over what the previous page load stored.
+    this.lastEventIdValue =
+      options.resumeFrom ?? readResumePoint(this.persistStorage, this.persistKey ?? "");
     this.parser = createSSEParser({
       maxBufferSize: options.maxBufferSize ?? DEFAULT_MAX_BUFFER_SIZE,
       overflowPolicy: options.overflowPolicy ?? "close",
@@ -198,6 +295,8 @@ export class SSEClient<E extends object = SSEEventMap> {
     if (options.onOpen) this.onOpen(options.onOpen);
     if (options.onClose) this.onClose(options.onClose);
     if (options.onOverflow) this.onOverflow(options.onOverflow);
+    if (options.onSuspectGap) this.onSuspectGap(options.onSuspectGap);
+    if (options.onResume) this.onResume(options.onResume);
     if (options.autoStart !== false) {
       this.start();
     }
@@ -235,11 +334,21 @@ export class SSEClient<E extends object = SSEEventMap> {
 
   /** Open the connection. No-op while already running or suspended. */
   start(): this {
-    if (this.running || this.suspended) {
+    if (this.running) {
+      // `close()` aborts the attempt, but `running` only clears once the loop has
+      // unwound. Queueing the start is what makes `stop(); start();` work instead
+      // of silently leaving the client closed.
+      if (this.finished) {
+        this.pendingRestart = true;
+      }
       return this;
     }
     if (this.finished) {
       this.reset();
+    }
+    // A suspended loop (offline, hidden page) is woken by resume(), not by start().
+    if (this.suspended) {
+      return this;
     }
     // Bind the lifecycle listeners before the hidden-page check: a client
     // constructed while the page is hidden (WebView preload, background tab)
@@ -283,17 +392,24 @@ export class SSEClient<E extends object = SSEEventMap> {
     this.finish("user");
   }
 
+  /**
+   * Replace the resume point used by the next connection.
+   *
+   * The usual caller is an `onSuspectGap` handler: refetch a snapshot, then hand
+   * its id to the client so the reconnect asks the server to continue from there.
+   * The running stream is left untouched — rewinding `Last-Event-ID` mid-stream
+   * would desynchronise the parser instead of healing the gap.
+   */
+  setResumePoint(id: string): void {
+    this.pendingResumePoint = id;
+  }
+
   /** Reconnect after closing, keeping `lastEventId` so the server can resume. */
   restart(): this {
     this.close();
-    if (!this.running) {
-      return this.start();
-    }
-    // `close()` aborts the loop, but `running` only clears once that loop unwinds.
-    // Starting synchronously would hit the `running` guard in start() and do nothing,
-    // leaving the client closed for good; hand the restart to the loop exit instead.
-    this.pendingRestart = true;
-    return this;
+    // `start()` queues itself when the loop has not unwound yet, and the resume
+    // state survives because only `reset()` clears it.
+    return this.start();
   }
 
   /** Subscribe to one event name; returns an unsubscribe function. */
@@ -360,6 +476,16 @@ export class SSEClient<E extends object = SSEEventMap> {
     return subscribe(this.overflowHandlers, handler);
   }
 
+  /** Subscribe to "the stream may have skipped data" reports (see `onSuspectGap`). */
+  onSuspectGap(handler: (info: SSEGapInfo) => void): Unsubscribe {
+    return subscribe(this.gapHandlers, handler);
+  }
+
+  /** Subscribe to resume verification reports (see `onResume`). */
+  onResume(handler: (info: SSEResumeInfo) => void): Unsubscribe {
+    return subscribe(this.resumeHandlers, handler);
+  }
+
   // ---------------------------------------------------------------------------
   // Internals
   // ---------------------------------------------------------------------------
@@ -388,7 +514,13 @@ export class SSEClient<E extends object = SSEEventMap> {
     this.finished = false;
     this.attempt = 0;
     this.idleTimedOut = false;
+    this.gapReported = false;
+    this.resumeCheckPending = false;
+    this.resumeCheckFrom = "";
     this.rotating = false;
+    this.handedOver = false;
+    this.probing = false;
+    this.discardPreparedAttempt();
     this.suspended = null;
     this.suspendAbort = false;
     this.pendingRestart = false;
@@ -413,12 +545,16 @@ export class SSEClient<E extends object = SSEEventMap> {
       this.suspendAbort = false;
       this.setState(this.attempt === 0 ? "connecting" : "reconnecting");
 
-      this.attemptController = new AbortController();
+      // An overlap rotation leaves an accepted candidate behind: adopt its controller so
+      // closing or suspending the client also aborts the connection that replaced the old one.
+      const prepared = this.preparedAttempt;
+      this.preparedAttempt = null;
+      this.attemptController = prepared?.controller ?? new AbortController();
       const signal = this.attemptController.signal;
 
       let failure: SSEError | null = null;
       try {
-        await this.openOnce(signal);
+        await this.openOnce(signal, prepared?.response);
       } catch (error) {
         failure = toSSEError(error);
       }
@@ -440,8 +576,10 @@ export class SSEClient<E extends object = SSEEventMap> {
       }
 
       // Proactive rotation: reconnect immediately, keeping lastEventId and skipping backoff.
-      if (this.rotating) {
+      // In overlap mode the abort comes from handing the stream over, which is not a failure.
+      if (this.rotating || this.handedOver) {
         this.rotating = false;
+        this.handedOver = false;
         this.attempt = 0;
         continue;
       }
@@ -483,13 +621,16 @@ export class SSEClient<E extends object = SSEEventMap> {
         return;
       }
 
+      // Report before sleeping: the handler may refetch a snapshot and call
+      // `setResumePoint`, which then applies to the attempt that is about to open.
+      this.reportGap("reconnect");
       this.setState("reconnecting");
       await this.sleep(delay);
     }
   }
 
-  /** Open one connection and read it until the stream ends (throws on failure). */
-  private async openOnce(signal: AbortSignal): Promise<void> {
+  /** Open one connection and validate it (throws on failure). */
+  private async request(signal: AbortSignal): Promise<Response> {
     const { url, method = "POST", body, fetch: fetchImpl } = this.options;
     const init: RequestInit = {
       method,
@@ -507,6 +648,8 @@ export class SSEClient<E extends object = SSEEventMap> {
         kind: "http",
         status: response.status,
         retryable: isRetryableStatus(response.status),
+        // A 429/503 usually knows better than the backoff curve when to come back.
+        retryAfter: parseRetryAfter(response.headers.get("retry-after")),
       });
     }
     if (this.options.strictContentType !== false) {
@@ -527,13 +670,41 @@ export class SSEClient<E extends object = SSEEventMap> {
         retryable: false,
       });
     }
+    return response;
+  }
+
+  /**
+   * Open one connection and read it until the stream ends (throws on failure).
+   *
+   * @param prepared an already accepted candidate from an overlap rotation: it replaces the
+   *   request, so the switch costs no reconnect gap.
+   */
+  private async openOnce(signal: AbortSignal, prepared?: Response): Promise<void> {
+    const response = prepared ?? (await this.request(signal));
 
     this.setState("open");
+    // A fresh connection starts a new episode: the next gap is worth reporting again.
+    this.gapReported = false;
+    // If this request carried a resume point, the first identified event decides
+    // whether the server continued from it or silently started at "now".
+    if (this.lastEventIdValue) {
+      this.resumeCheckPending = true;
+      this.resumeCheckFrom = this.lastEventIdValue;
+    }
     this.armRotate();
     this.emit(this.openHandlers, response);
 
     this.parser.reset();
-    const reader = response.body.getReader();
+    const body = response.body;
+    if (!body) {
+      // A prepared response already passed validation; this narrowing is for the compiler.
+      throw new SSEError("Streaming is not supported in this environment (response.body is null)", {
+        kind: "protocol",
+        status: response.status,
+        retryable: false,
+      });
+    }
+    const reader = body.getReader();
     // Decode in streaming mode so multi-byte characters split across chunks survive.
     const decoder = new TextDecoder("utf-8");
     this.armIdle();
@@ -592,6 +763,7 @@ export class SSEClient<E extends object = SSEEventMap> {
     if (this.parser.dropped !== this.lastDropped) {
       this.lastDropped = this.parser.dropped;
       this.emit(this.overflowHandlers, this.lastDropped);
+      this.reportGap("drop");
     }
     if (this.parser.overflowed) {
       // The server never terminates a line, or a single message is huge;
@@ -603,6 +775,46 @@ export class SSEClient<E extends object = SSEEventMap> {
     }
   }
 
+  /**
+   * Tell listeners the stream may have skipped data. At most once per episode:
+   * the flag clears when a connection opens, so a ten-minute outage with retries
+   * every 30s produces one report, not twenty.
+   */
+  private reportGap(reason: SSEGapReason): void {
+    // Without a resume point there is nothing to continue from, but a dropped
+    // message is data loss either way, so that reason is always reported.
+    if (reason !== "drop" && !this.lastEventIdValue) {
+      return;
+    }
+    if (this.gapReported) {
+      return;
+    }
+    this.gapReported = true;
+    this.emit(this.gapHandlers, {
+      reason,
+      lastId: this.lastEventIdValue,
+      attempt: this.attempt,
+    });
+  }
+
+  /** Compare the first id of the new stream with the resume point that was sent. */
+  private reportResume(firstId: string): void {
+    const lastId = this.resumeCheckFrom;
+    this.resumeCheckFrom = "";
+    const from = toIntegerId(lastId);
+    const to = toIntegerId(firstId);
+    const skipped = from === null || to === null ? undefined : to - from;
+    this.emit(this.resumeHandlers, {
+      lastId,
+      firstId,
+      skipped,
+      // 0 replays the last event, 1 is a perfect continuation; anything above is a
+      // hole, and negatives are duplicates the server sent twice.
+      continuous: skipped === undefined ? undefined : skipped <= 1,
+      attempt: this.attempt,
+    });
+  }
+
   private async resolveHeaders(): Promise<Headers> {
     const { headers, method = "POST" } = this.options;
     const extra = typeof headers === "function" ? await headers() : headers;
@@ -612,6 +824,14 @@ export class SSEClient<E extends object = SSEEventMap> {
     }
     if (method !== "GET" && !resolved.has("Content-Type")) {
       resolved.set("Content-Type", "application/json");
+    }
+    // A resume point set while a stream was running replaces the in-memory one at
+    // the moment the next request is built, so an in-flight stream is never
+    // rewound and the new position is what the server resumes from.
+    if (this.pendingResumePoint !== null) {
+      this.lastEventIdValue = this.pendingResumePoint;
+      this.pendingResumePoint = null;
+      this.schedulePersist();
     }
     if (this.lastEventIdValue) {
       resolved.set("Last-Event-ID", this.lastEventIdValue);
@@ -635,9 +855,16 @@ export class SSEClient<E extends object = SSEEventMap> {
         return;
       }
     }
+    // Verified before the allow-list filter and before the id fallback: the check
+    // is about what the server said, not about what this client cares about.
+    if (this.resumeCheckPending && event.id) {
+      this.resumeCheckPending = false;
+      this.reportResume(event.id);
+    }
     const id = event.id || this.lastEventIdValue;
-    if (id) {
+    if (id && id !== this.lastEventIdValue) {
       this.lastEventIdValue = id;
+      this.schedulePersist();
     }
     const name = event.event || "message";
     // Filter after updating the id so the resume position never moves backwards.
@@ -704,13 +931,18 @@ export class SSEClient<E extends object = SSEEventMap> {
     if (context.attempt > this.maxRetry) {
       return false;
     }
-    return this.nextDelay(context.attempt);
+    return this.nextDelay(context.attempt, context.error?.retryAfter);
   }
 
-  /** Reconnect delay: the server's `retry:` wins, otherwise exponential backoff with ±20% jitter. */
-  private nextDelay(attempt: number): number {
-    if (this.serverRetryDelay !== undefined) {
-      return Math.max(Math.min(this.serverRetryDelay, this.retryMaxDelay), MIN_RETRY_DELAY);
+  /**
+   * Reconnect delay. Precedence: `Retry-After` on the failed response, then the
+   * stream's `retry:` field, then exponential backoff with ±20% jitter. Both
+   * server hints are clamped so a broken header cannot park the client for a day.
+   */
+  private nextDelay(attempt: number, retryAfter?: number): number {
+    const hinted = retryAfter ?? this.serverRetryDelay;
+    if (hinted !== undefined) {
+      return Math.max(Math.min(hinted, this.retryMaxDelay), MIN_RETRY_DELAY);
     }
     const exponential = Math.min(this.retryMaxDelay, this.retryBaseDelay * 2 ** (attempt - 1));
     const jittered = Math.round(exponential * (0.8 + Math.random() * 0.4));
@@ -764,9 +996,72 @@ export class SSEClient<E extends object = SSEEventMap> {
     }
     this.clearRotate();
     this.rotateTimer = setTimeout(() => {
+      if (this.options.rotateMode === "overlap") {
+        void this.rotateOverlap();
+        return;
+      }
+      // `restart` closes first and leans on `Last-Event-ID`; `overlap` promises no
+      // gap, so only the restart path is worth warning about.
+      this.reportGap("rotate");
       this.rotating = true;
       this.attemptController?.abort();
     }, interval);
+  }
+
+  /**
+   * Overlap rotation: request the next connection while the current one keeps streaming, and
+   * take it over only once it is accepted.
+   *
+   * The switch is the abort plus the prepared response: the loop unwinds the old attempt and
+   * adopts the candidate instead of opening a third one. Everything the server wrote in
+   * between waits in the candidate's stream buffer, so no event is lost and none is replayed.
+   */
+  private async rotateOverlap(): Promise<void> {
+    if (this.probing || this.finished || this.suspended || this.preparedAttempt) {
+      return;
+    }
+    this.probing = true;
+    const controller = new AbortController();
+    this.probeController = controller;
+    const timeout = this.options.rotateTimeout ?? DEFAULT_ROTATE_TIMEOUT;
+    const timer = setTimeout(() => controller.abort(), timeout);
+
+    try {
+      const response = await this.request(controller.signal);
+      const current = this.attemptController;
+      if (this.finished || this.suspended || !current) {
+        // Nothing to hand the candidate over to: release it instead of parking a stream.
+        await discardBody(response);
+        return;
+      }
+      this.preparedAttempt = { response, controller };
+      this.handedOver = true;
+      current.abort();
+    } catch (error) {
+      // A candidate that cannot be opened says nothing about the stream that is running:
+      // keep it and try again on the next tick instead of trading it for a broken connection.
+      const probeError = toSSEError(error);
+      if (!this.finished && !this.suspended && probeError.kind !== "aborted") {
+        this.emit(this.errorHandlers, probeError, this.attempt);
+        this.armRotate();
+      }
+    } finally {
+      clearTimeout(timer);
+      this.probeController = null;
+      this.probing = false;
+    }
+  }
+
+  /** Drop a candidate the loop never adopted (close, restart, reset). */
+  private discardPreparedAttempt(): void {
+    const prepared = this.preparedAttempt;
+    this.preparedAttempt = null;
+    this.handedOver = false;
+    if (!prepared) {
+      return;
+    }
+    prepared.controller.abort();
+    void discardBody(prepared.response);
   }
 
   private clearIdle(): void {
@@ -786,6 +1081,44 @@ export class SSEClient<E extends object = SSEEventMap> {
   private clearTimers(): void {
     this.clearIdle();
     this.clearRotate();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Resume point persistence
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Mark the resume point dirty.
+   *
+   * Writing on every event would turn a fast stream into one synchronous storage
+   * write per message, so writes are coalesced to at most one per
+   * `PERSIST_THROTTLE` and flushed on close, suspend and `pagehide`.
+   */
+  private schedulePersist(): void {
+    if (!this.persistStorage) {
+      return;
+    }
+    this.persistDirty = true;
+    if (this.persistTimer) {
+      return;
+    }
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      this.flushPersist();
+    }, PERSIST_THROTTLE);
+  }
+
+  /** Write the pending resume point to storage, if it changed. */
+  private flushPersist(): void {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    if (!this.persistDirty) {
+      return;
+    }
+    this.persistDirty = false;
+    writeResumePoint(this.persistStorage, this.persistKey ?? "", this.lastEventIdValue);
   }
 
   private setState(next: SSEStatus): void {
@@ -819,6 +1152,17 @@ export class SSEClient<E extends object = SSEEventMap> {
     }
 
     if (
+      this.persistStorage &&
+      typeof window !== "undefined" &&
+      typeof window.addEventListener === "function"
+    ) {
+      // `pagehide` also fires when the page enters the back/forward cache, which is
+      // the last moment a synchronous storage write is guaranteed to complete.
+      this.onPageHide = () => this.flushPersist();
+      window.addEventListener("pagehide", this.onPageHide);
+    }
+
+    if (
       this.options.pauseWhenHidden &&
       typeof document !== "undefined" &&
       typeof document.addEventListener === "function"
@@ -839,11 +1183,15 @@ export class SSEClient<E extends object = SSEEventMap> {
       if (this.onOffline) window.removeEventListener("offline", this.onOffline);
       if (this.onOnline) window.removeEventListener("online", this.onOnline);
     }
+    if (this.onPageHide && typeof window !== "undefined") {
+      window.removeEventListener("pagehide", this.onPageHide);
+    }
     if (this.onVisibilityChange && typeof document !== "undefined") {
       document.removeEventListener("visibilitychange", this.onVisibilityChange);
     }
     this.onOffline = undefined;
     this.onOnline = undefined;
+    this.onPageHide = undefined;
     this.onVisibilityChange = undefined;
     this.lifecycleBound = false;
   }
@@ -854,7 +1202,12 @@ export class SSEClient<E extends object = SSEEventMap> {
     }
     this.suspended = reason;
     this.suspendAbort = true;
+    // The page may be frozen from here on: persist before anything else.
+    this.flushPersist();
     this.clearTimers();
+    this.probeController?.abort();
+    this.probeController = null;
+    this.discardPreparedAttempt();
     this.attemptController?.abort();
     this.setState("idle");
   }
@@ -863,6 +1216,9 @@ export class SSEClient<E extends object = SSEEventMap> {
     if (this.finished) {
       return;
     }
+    // The connection was aborted at suspend time, so anything produced since then
+    // is unaccounted for.
+    this.reportGap("resume");
     this.suspended = null;
     this.attempt = 0;
     if (this.running) {
@@ -878,7 +1234,11 @@ export class SSEClient<E extends object = SSEEventMap> {
       return;
     }
     this.finished = true;
+    this.flushPersist();
     this.clearTimers();
+    this.probeController?.abort();
+    this.probeController = null;
+    this.discardPreparedAttempt();
     this.unbindLifecycle();
     this.cancelController.abort();
     this.attemptController?.abort();
@@ -888,6 +1248,53 @@ export class SSEClient<E extends object = SSEEventMap> {
     this.setState("closed");
     this.emit(this.closeHandlers, reason, error);
   }
+}
+
+/** Default time budget for an overlap rotation candidate. */
+const DEFAULT_ROTATE_TIMEOUT = 30_000;
+
+/** Release a candidate stream the client decided not to adopt. */
+async function discardBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // The body may already be locked, aborted or fully read; nothing to release then.
+  }
+}
+
+/**
+ * Parse an event id as an integer, or `null`.
+ *
+ * SSE ids are opaque strings — the spec never says they are ordered — so this is
+ * only a best-effort reading, and `onResume` leaves `skipped` undefined when it
+ * fails instead of inventing a comparison.
+ */
+function toIntegerId(id: string): number | null {
+  if (!/^-?\d+$/.test(id)) {
+    return null;
+  }
+  const value = Number(id);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+/**
+ * `Retry-After` is either delta-seconds (`120`) or an HTTP date
+ * (`Wed, 21 Oct 2015 07:28:00 GMT`); both become a delay in milliseconds.
+ */
+function parseRetryAfter(value: string | null): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  const seconds = Number(trimmed);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.round(seconds * 1000);
+  }
+  const at = Date.parse(trimmed);
+  if (Number.isNaN(at)) {
+    return undefined;
+  }
+  return Math.max(0, at - Date.now());
 }
 
 /** Serialize the body: strings / Blob / FormData pass through, everything else becomes JSON. */

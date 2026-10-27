@@ -26,16 +26,28 @@ export class SSEError extends Error {
   readonly status?: number;
   /** Whether the connection may be retried. */
   readonly retryable: boolean;
+  /**
+   * Delay the server asked for through `Retry-After`, in milliseconds. Set on
+   * 429/503 responses; a custom `retry` policy can read it instead of guessing.
+   */
+  readonly retryAfter?: number;
 
   constructor(
     message: string,
-    options: { kind?: SSEErrorKind; status?: number; retryable?: boolean; cause?: unknown } = {},
+    options: {
+      kind?: SSEErrorKind;
+      status?: number;
+      retryable?: boolean;
+      retryAfter?: number;
+      cause?: unknown;
+    } = {},
   ) {
     super(message);
     this.name = "SSEError";
     this.kind = options.kind ?? "network";
     this.status = options.status;
     this.retryable = options.retryable ?? true;
+    this.retryAfter = options.retryAfter;
     if (options.cause !== undefined) {
       (this as { cause?: unknown }).cause = options.cause;
     }
