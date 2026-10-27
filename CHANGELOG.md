@@ -4,7 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] — 2026-10-27
+
+The release that makes the option list readable — six groups instead of 38 top-level
+fields — and turns the sharing helpers into things you import on purpose.
 
 ### Added
 
@@ -149,7 +152,7 @@ we still have".
   `Last-Event-ID` resume, idle watchdog, scheduled rotation, pluggable retry policy and
   the optional Vue 3 entry point.
 
-[Unreleased]: https://github.com/hesetiema/sse-client/compare/v0.1.4...HEAD
+[0.2.0]: https://github.com/hesetiema/sse-client/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/hesetiema/sse-client/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/hesetiema/sse-client/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/hesetiema/sse-client/compare/v0.1.0...v0.1.2
