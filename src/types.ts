@@ -31,8 +31,12 @@ export type Unsubscribe = () => void;
  * - `rotate`: a scheduled `restart`-mode rotation closed the stream
  * - `drop`: a message exceeded `maxBufferSize` and was discarded
  * - `promote`: a multi-tab follower took over from a leader that went away
+ * - `id`: the server sent an id that cannot survive a `Last-Event-ID` round trip,
+ *   so it was refused and the resume point stayed where it was (see
+ *   `isValidEventId`). Reported once per client, not once per episode: it is a
+ *   server contract violation, and the next reconnect will hit it again.
  */
-export type SSEGapReason = "reconnect" | "resume" | "rotate" | "drop" | "promote";
+export type SSEGapReason = "reconnect" | "resume" | "rotate" | "drop" | "promote" | "id";
 
 /**
  * Reported through `onResume` on the first event after a connection that carried

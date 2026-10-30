@@ -299,6 +299,7 @@ defaults are the operating point the client was designed around.
 | `resume` | `from` | `string` | — | Resume point for the first request, sent as `Last-Event-ID`; use it to continue where a previous page load stopped |
 | `resume` | `persist` | `string \| boolean` | — | Keep `lastEventId` in storage across reloads. `true` derives the key from the subscription; writes are throttled to 1/s and flushed on close and `pagehide` |
 | `resume` | `storage` | `ResumeStorage \| null` | `sessionStorage` | Where `persist` reads and writes; `null` disables it (SSR, sandboxed iframes) |
+| `resume` | `dedupe` | `boolean` | `false` | Suppress events whose id was already delivered, across reconnects. Turn it on for **token streams** (an AI reply), where an inclusive replay duplicates a visible token; leave it off for latest-value streams, where a duplicate is harmless and deduping retains one id per event |
 | `retry` | *(function)* | `(ctx) => number \| false \| Promise<number \| false>` | — | Custom policy: it owns the delay, so the knobs below are ignored |
 | `retry` | `max` | `number` | `Infinity` | Retry limit |
 | `retry` | `baseDelay` | `number` | `1000` | Delay before the first retry (ms) |
@@ -337,6 +338,8 @@ yourself) and `onOverflow` (watch `dropped`, or `hooks.gap` with
 | `lastEventId` | `string` | Latest event id, sent back on reconnect |
 | `url` | `string` | The URL requested |
 | `dropped` | `number` | Messages discarded by the cap (only grows with `overflowPolicy: "drop"`) |
+| `invalidIds` | `number` | Ids refused because they cannot survive a `Last-Event-ID` round trip (whitespace, newline, NUL, empty), including the ones `setResumePoint` was handed. The resume point is never advanced to one, and the message is still delivered |
+| `duplicates` | `number` | Events suppressed as replays under `resume.dedupe` |
 | `done` | `Promise<void>` | Resolves when the connection terminates; never rejects |
 
 #### Methods
@@ -346,7 +349,7 @@ yourself) and `onOverflow` (watch `dropped`, or `hooks.gap` with
 | `start()` | Open the connection (no-op while running or suspended) |
 | `close()` | Close and stop reconnecting |
 | `restart()` | Close, then reconnect while keeping `lastEventId` |
-| `setResumePoint(id)` | Replace the resume point used by the **next** connection, e.g. with a snapshot id after a gap |
+| `setResumePoint(id)` | Replace the resume point used by the **next** connection, e.g. with a snapshot id after a gap. An id that cannot be echoed back is refused (the old point is kept, `invalidIds` grows) |
 | `on(event, handler)` | Subscribe to one event name; returns an unsubscribe function |
 | `on("*", handler)` | Subscribe to every message |
 | `once(event, handler)` | Subscribe for a single delivery |
@@ -413,6 +416,48 @@ Stable key from `url`, `method`, `body` and `events`; object keys are sorted and
 arrays are compared as sets. A `body` factory is resolved first, so changed filters mean a
 different key. Exposed so an explicit `key` can follow the same rules.
 
+### `createJoinClient(options)`
+
+Replay an existing run from the start, then hand its tail to the live connection. For F5, a new
+tab, and a multi-tab takeover — the new reader has seen nothing, and `Last-Event-ID` cannot
+express "from the beginning".
+
+```ts
+import { SSEClient, createJoinClient } from "@songfreedom/sse-client";
+
+const live = new SSEClient({ url: "/api/chat", request: { body: { threadId } } });
+
+// The page reopened: replay the run, then continue from where it ended.
+const { done } = createJoinClient({
+  url: "/api/chat",
+  join: { runId },
+  parse: JSON.parse,
+});
+live.setResumePoint(await done);
+```
+
+Three deliberate choices, all so one request asks one question:
+
+- **No `Last-Event-ID`.** The cursor on this route is `offset`; adding a stale header lets the
+  server pick whichever it prefers.
+- **`reconnectOnEnd` off.** A replay is a finite read; reconnecting past its final offset only
+  opens an empty window.
+- **`method: "GET"`, no body**, so the server cannot mistake it for a new subscription.
+- **No persistence.** A replay is a reader, not the owner of the subscription: writing the same
+  storage key would race the live client, and an aborted replay would leave a half-consumed
+  position behind. `done` is the only handover.
+
+`done` resolves with the last id once the stream ends, and `""` when the server sent no ids at
+all (only a snapshot can be trusted then). `join.params` renames the query parameters,
+`join.startOffset` changes the "from the start" value, and `deriveJoinUrl(url, join)` builds the
+URL alone (keeping existing parameters and the hash).
+
+### `isValidEventId(id)`
+
+Whether an id can echo back through `Last-Event-ID`: non-empty, no `\r`/`\n`/`\0`, no leading or
+trailing whitespace. The client checks received ids and `setResumePoint` arguments with it;
+it is exported so a server and its tests can share one rule instead of writing their own.
+
 ### `SSEMessage`
 
 ```ts
@@ -469,7 +514,7 @@ them to a question it cannot answer.
 | Signal | Fires when | What you learn | What to do with it |
 | --- | --- | --- | --- |
 | `lastEventId` (property) | after any event that carried an `id:` | the point the **next** connection will ask for | nothing — it is the bookkeeping the rest builds on |
-| `hooks.gap` (`onSuspectGap`) — `{ reason, lastId, attempt }` | once per episode, when continuity **cannot be proven**: `reconnect` (an attempt ended), `resume` (page or network came back), `rotate` (`restart` mode only), `drop` (a message exceeded `maxBufferSize`), `promote` (a tab took over) | only that something *may* be missing — never what | refetch a snapshot, then `setResumePoint(snapshot.id)` |
+| `hooks.gap` (`onSuspectGap`) — `{ reason, lastId, attempt }` | once per episode, when continuity **cannot be proven**: `reconnect` (an attempt ended), `resume` (page or network came back), `rotate` (`restart` mode only), `drop` (a message exceeded `maxBufferSize`), `promote` (a tab took over), `id` (the server sent an id that cannot be echoed back) | only that something *may* be missing — never what | refetch a snapshot, then `setResumePoint(snapshot.id)` |
 | `hooks.resume` (`onResume`) — `{ lastId, firstId, skipped, continuous }` | on the first event with an id, after a request that carried `Last-Event-ID` | whether the server continued, and how far it jumped; both `skipped` and `continuous` are `undefined` when ids are opaque | metrics and logs; `continuous === false` means a real hole |
 | `setResumePoint(id)` | you call it | which point the next connection asks for | right after healing a gap, with the snapshot id |
 
@@ -486,6 +531,24 @@ If the server sends no `id:`, the resume story does not exist: there is nothing 
 server to continue from, so neither `hooks.gap` (except for `drop`, which is local data
 loss) nor `hooks.resume` will fire. Treat a silently lossy stream as a server-contract problem,
 not something the client can paper over.
+
+### An id has to echo back
+
+An id makes a round trip the client does not control: into the `Last-Event-ID` header, and
+possibly into `sessionStorage`. Every hop eats something — `\r`, `\n` and `\0` cannot live in
+a header value, and leading/trailing whitespace is trimmed. So the id is validated
+(`isValidEventId`) **before it is accepted**: an unmatchable one is refused, the resume point
+**stays where it was**, the message is still delivered (its payload is not in question, only
+the position it claimed), `invalidIds` grows, and `hooks.gap` reports it once with
+`reason: "id"`.
+
+Refusing matters. Accepting a point the server cannot match is worse than having none: the next
+connection asks for a position the server does not know, the stream restarts somewhere
+arbitrary, and **nothing reports it** — because nothing looked wrong.
+
+`setResumePoint` and the point picked up from storage go through the same check. A poisoned
+`sessionStorage` value (rewritten by a proxy, hand-edited) is dropped instead of breaking every
+reconnect for that tab.
 
 ## Low-level building blocks
 
@@ -520,13 +583,58 @@ server and use the buffer for what the chart displays.
 
 ## Server requirements
 
+### Transport
+
 - Respond with `Content-Type: text/event-stream` (a `;charset=UTF-8` suffix is fine).
 - Do not buffer the response: `proxy_buffering off; proxy_cache off;` at the gateway,
   and do not gzip the stream.
 - Send a heartbeat comment (`: ping\n\n`) every 15–30s, otherwise most load balancers
   close the connection after 60s of silence. Pair it with `idleTimeout`.
-- Support `Last-Event-ID` if you want gap-free reconnects; the client sends the header but
-  does not de-duplicate events.
+
+### Ids and resume (what makes `Last-Event-ID` trustworthy)
+
+`hooks.resume` only checks what the server *says* it resumed from; it cannot prove the
+server actually can. Four rules make it true:
+
+1. **An id must echo back**: non-empty, no `\r`/`\n`/`\0`, no leading or trailing
+   whitespace. The client refuses one that does not (`isValidEventId`); the server should
+   not mint one in the first place.
+2. **One id per event, unique.** Two events sharing an id means a resume starts in the
+   middle of one.
+3. **Persist, then send.** An id means "everything up to here is stored". If the server
+   writes the socket first and the log asynchronously, a client returning with that id may
+   find the entry missing — it computes a `skipped` that looks continuous while the event is
+   already gone. This is the one contract the client cannot discover on its own.
+4. **If you replay inclusively, let the client dedupe.** Re-sending the last event is legal
+   (`skipped === 0` reports it), but for a token stream it is a visible error: send strictly
+   after the id, or turn on `resume.dedupe`.
+
+### A disconnect is not a cancel
+
+`pauseWhenHidden`, going offline and a page reload all **abort the request**. If the server
+reads "socket closed" as "the user wants to stop", switching back to the tab shows half an
+answer. Keep them apart: a dropped connection only means **no observer** — the run should
+finish into the log; only an explicit cancel stops it. `setResumePoint` and `joinRun` both
+depend on that distinction.
+
+### A second, read-only channel (F5, new tab, multi-tab takeover)
+
+`Last-Event-ID` can only say "continue after this"; it cannot say "replay this run from the
+start", which is exactly what a freshly opened page needs. Provide both:
+
+- `POST` for subscriptions, carrying `Last-Event-ID` for incremental resume;
+- `GET ?offset=-1&runId=…` for a read-only replay that **starts no generation**, safe to call
+  from a new tab.
+
+The client counterpart is `createJoinClient()`, below.
+
+### Snapshot semantics
+
+The standard reaction to `hooks.gap` is "refetch a snapshot, then
+`setResumePoint(snapshot.id)`". For that to be reliable, the snapshot endpoint must return
+what is stored **at the moment of the call, never waiting for new data**, and return empty
+rather than erroring or parking when there is nothing. Otherwise healing a gap introduces a
+new timeout of its own.
 
 ## Design notes
 

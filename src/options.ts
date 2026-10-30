@@ -74,6 +74,20 @@ export interface ResumeOptions {
   persist?: string | boolean;
   /** Storage for `persist`; defaults to `sessionStorage`. Pass `null` to disable. */
   storage?: ResumeStorage | null;
+  /**
+   * Suppress events whose id was already delivered, including across reconnects.
+   * Defaults to `false`: the client reports the replay through `hooks.resume`
+   * (`skipped === 0`) instead of dropping it.
+   *
+   * Turn it on for **token streams** — an AI reply, a log tail — where a replayed
+   * event corrupts the rendered output and the user can see it. Leave it off for
+   * **latest-value streams** (IoT points, device state): a duplicate is harmless,
+   * and deduping costs one retained id per event for the client's lifetime.
+   *
+   * A resume point restored from storage cannot suppress the first replay, because
+   * this instance never delivered that event itself.
+   */
+  dedupe?: boolean;
 }
 
 /**
@@ -332,6 +346,7 @@ export interface ResolvedSSEClientOptions {
   resumeFrom?: string;
   persistKey?: string | boolean;
   persistStorage?: ResumeStorage | null;
+  dedupe?: boolean;
   idleTimeout?: number;
   rotateInterval?: number;
   rotateMode?: "restart" | "overlap";
@@ -395,6 +410,7 @@ export function normalizeOptions(options: SSEClientOptions): ResolvedSSEClientOp
     resumeFrom: pick(resume.from, options.resumeFrom),
     persistKey: pick(resume.persist, options.persistKey),
     persistStorage: pick(resume.storage, options.persistStorage),
+    dedupe: resume.dedupe,
     idleTimeout: pick(stream.idleTimeout, options.idleTimeout),
     rotateInterval: pick(rotate?.interval, options.rotateInterval),
     rotateMode: pick(rotate?.mode, options.rotateMode),

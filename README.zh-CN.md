@@ -284,6 +284,7 @@ const { status } = useSSE({
 | `resume` | `from` | `string` | — | 首次请求的续传位点，作为 `Last-Event-ID` 发送；用于从上次页面停留处继续 |
 | `resume` | `persist` | `string \| boolean` | — | 把 `lastEventId` 落到存储，跨刷新延续。`true` 时按订阅推导键；写入节流到 1 次/秒，并在关闭、`pagehide` 时立即落盘 |
 | `resume` | `storage` | `ResumeStorage \| null` | `sessionStorage` | `persist` 使用的存储；传 `null` 关闭（SSR、受限 iframe） |
+| `resume` | `dedupe` | `boolean` | `false` | 按 id 抑制**已经投递过**的事件，跨重连生效。token 流（AI 回答）建议开启：服务端 inclusive replay 会重复一个 token，用户看得见。最新值流保持关闭——重复无害，而开启后每个事件都要留一个 id |
 | `retry` | *（函数）* | `(ctx) => number \| false \| Promise<number \| false>` | — | 自定义策略：延迟完全由它决定，下面的退避参数被忽略 |
 | `retry` | `max` | `number` | `Infinity` | 重试次数上限 |
 | `retry` | `baseDelay` | `number` | `1000` | 首次重试前的等待时间（ms） |
@@ -320,6 +321,8 @@ const { status } = useSSE({
 | `lastEventId` | `string` | 最新事件 id，重连时会带回服务端 |
 | `url` | `string` | 实际请求的地址 |
 | `dropped` | `number` | 因超限被丢弃的消息数（`overflowPolicy: "drop"` 时才会增长） |
+| `invalidIds` | `number` | 被拒绝的 id 数：服务端给的 id 无法原样带回 `Last-Event-ID`（含空格、换行、NUL，或空串），或 `setResumePoint` 收到这种值。被拒绝的位点不会推进，消息本身照常投递 |
+| `duplicates` | `number` | 因 `resume.dedupe` 被抑制的重复事件数 |
 | `done` | `Promise<void>` | 连接终止时兑现，永不 reject |
 
 #### 方法
@@ -329,7 +332,7 @@ const { status } = useSSE({
 | `start()` | 建立连接（运行中或挂起时为空操作） |
 | `close()` | 关闭并停止重连 |
 | `restart()` | 先关闭再重连，同时保留 `lastEventId` |
-| `setResumePoint(id)` | 替换**下一次**连接的续传位点，例如漏数据后重拉快照拿到的 id |
+| `setResumePoint(id)` | 替换**下一次**连接的续传位点，例如漏数据后重拉快照拿到的 id。id 无法原样带回 `Last-Event-ID` 时会被拒绝（旧位点保留，`invalidIds` +1） |
 | `on(event, handler)` | 订阅单个事件名，返回取消订阅函数 |
 | `on("*", handler)` | 订阅所有消息 |
 | `once(event, handler)` | 只订阅一次投递 |
@@ -389,6 +392,43 @@ onScopeDispose(() => sse.release());
 `body` 传函数时会先求值再入 key，因此筛选条件变化就是换 key。导出它，是为了手写 `key`
 时能沿用同一套规则。
 
+### `createJoinClient(options)`
+
+从头重放一个已存在的 run，然后把尾巴交给正在跑的那条连接。用于 F5、新标签页、多标签页
+接管——这些场景里新读者**什么都还没看到**，`Last-Event-ID` 表达不了「从头开始」。
+
+```ts
+import { SSEClient, createJoinClient } from "@songfreedom/sse-client";
+
+const live = new SSEClient({ url: "/api/chat", request: { body: { threadId } } });
+
+// 页面重新打开：先把这段 run 重放出来，再从它的终点继续。
+const { done } = createJoinClient({
+  url: "/api/chat",
+  join: { runId },
+  parse: JSON.parse,
+});
+live.setResumePoint(await done);
+```
+
+三个刻意的取舍，都是为了让一个请求只问一个问题：
+
+- **不发 `Last-Event-ID`**。这条路由的游标是 `offset`，再带一个旧位点等于让服务端自己挑。
+- **`reconnectOnEnd` 关掉**。重放是有限读，越过末尾再连只会打开一个空窗口。
+- **`method: "GET"`、无 body**，服务端不会把它误判成新订阅。
+- **不碰持久化**。重放是读者，不是这个订阅的主人：写同一个存储键会和 live 连接抢位点，
+  中途中断还会留下一个半消费的位置。交接只有 `done` 一个口子。
+
+`done` 在流结束时给出最后一个 id；服务端完全没发 id 时是空串（此时只有快照能当真）。
+`join.params` 可以改查询参数名，`join.startOffset` 可以改「从头」的取值。
+只想拼 URL 时用 `deriveJoinUrl(url, join)`（保留已有查询串与 hash）。
+
+### `isValidEventId(id)`
+
+判断一个 id 能否原样带回 `Last-Event-ID`：非空、不含 `\r`/`\n`/`\0`、前后无空白。客户端
+内部用它把关收到的 id 与 `setResumePoint` 的入参；导出它是为了服务端和测试能复用同一份
+规则，而不是各写一遍。
+
 ### `SSEMessage`
 
 ```ts
@@ -443,7 +483,7 @@ interface SSEResumeInfo {
 | 信号 | 何时触发 | 它告诉你什么 | 拿它做什么 |
 | --- | --- | --- | --- |
 | `lastEventId`（属性） | 任何带 `id:` 的事件之后 | **下一次**连接会向服务端要哪个位点 | 什么都不用做——它是其余信号的地基 |
-| `hooks.gap`（`onSuspectGap`）——`{ reason, lastId, attempt }` | 每「一段」一次，当连续性**无法证明**时：`reconnect`（一次尝试结束）、`resume`（页面或网络恢复）、`rotate`（仅 `restart` 模式）、`drop`（单条消息超过 `maxBufferSize`）、`promote`（标签页接管） | 只能说「可能缺了」，永远说不出缺了什么 | 重拉快照，然后 `setResumePoint(snapshot.id)` |
+| `hooks.gap`（`onSuspectGap`）——`{ reason, lastId, attempt }` | 每「一段」一次，当连续性**无法证明**时：`reconnect`（一次尝试结束）、`resume`（页面或网络恢复）、`rotate`（仅 `restart` 模式）、`drop`（单条消息超过 `maxBufferSize`）、`promote`（标签页接管）、`id`（服务端给的 id 无法原样带回，见下） | 只能说「可能缺了」，永远说不出缺了什么 | 重拉快照，然后 `setResumePoint(snapshot.id)` |
 | `hooks.resume`（`onResume`）——`{ lastId, firstId, skipped, continuous }` | 带 `Last-Event-ID` 的请求发出后，第一条带 id 的事件 | 服务端到底接上了没有、跳了多远；id 不透明时 `skipped` 与 `continuous` 都是 `undefined` | 埋点与日志；`continuous === false` 说明真有洞 |
 | `setResumePoint(id)` | 你主动调用 | 下一次连接要哪个位点 | 修完缺口后立刻用快照 id 调它 |
 
@@ -457,6 +497,20 @@ interface SSEResumeInfo {
 服务端不发 `id:` 时，续传这套故事根本不存在：没有位点可以让服务端「从这儿继续」，所以
 `hooks.gap`（除了本地丢数据的 `drop`）和 `hooks.resume` 都不会触发。静默丢数据的流是服务端
 契约问题，客户端没法糊过去。
+
+### id 必须能原样回声
+
+`id` 会走一趟客户端控制不了的往返：写进 `Last-Event-ID` 请求头，可能再进
+`sessionStorage`。每一跳都会吃掉点什么——`\r`、`\n`、`\0` 不能出现在头里，前后空白会被
+trim。所以客户端在**收下 id 之前**就校验（`isValidEventId`）：不合格的 id 直接拒绝，
+**续传位点原地不动**，消息本身照旧投递（载荷没问题，只是它宣称的位置不可信），计数进
+`invalidIds`，并通过 `hooks.gap` 的 `reason: "id"` 报一次。
+
+这个拒绝是必要的。收下一个服务端无法匹配的位点，比没有位点更糟：下一次连接会向服务端要一个
+它不认识的位置，流从某个任意点重新开始，而且**什么都不报**——因为看起来一切正常。
+
+`setResumePoint` 与「从存储里捡回来的旧位点」走同一套校验。被污染的
+`sessionStorage`（代理重写过、手改过）会被直接丢掉，而不是让这个标签页的每次重连都错位。
 
 ## 底层构件
 
@@ -490,12 +544,50 @@ ring.into(reused); // 同样的顺序写进已有数组，不产生分配
 
 ## 服务端要求
 
+### 传输
+
 - 响应 `Content-Type: text/event-stream`（带 `;charset=UTF-8` 后缀也可以）。
 - 不要缓冲响应：网关侧 `proxy_buffering off; proxy_cache off;`，也不要对流开 gzip。
 - 每 15–30s 发一次心跳注释（`: ping\n\n`），否则多数负载均衡在静默 60s 后断开连接；
   配合 `idleTimeout` 使用。
-- 想要无缝隙重连，服务端需支持 `Last-Event-ID`；客户端只负责发送该请求头，
-  不做事件去重。
+
+### id 与续传（`Last-Event-ID` 生效的前提）
+
+客户端的 `hooks.resume` 只能核对「服务端说接到了」，它证明不了服务端**真的**接得上。下面
+四条是它可信的前提：
+
+1. **id 必须能原样回声**：非空、不含 `\r`/`\n`/`\0`、前后没有空白。客户端会拒绝不合格的
+   id（`isValidEventId`），在此之前服务端就应当保证。
+2. **每个事件一个 id，且唯一**。同一 id 复用两个事件，续传就会从中间开始。
+3. **先落库，再下发**。id 的含义是「到这里为止的内容都已经存好」。如果服务端先写 socket
+   再异步落库，客户端拿着这个 id 回来时，日志里可能还没有这一条——它会算出一个看起来连续
+   的 `skipped`，而那条事件已经丢了。这是**唯一一条客户端无法自己发现的契约**。
+4. **inclusive replay 要么别做，要么让客户端去重**。服务端把最后一条事件再发一遍是合法的
+   （`skipped === 0` 就是在报这个），但对 token 流是可见的错误，所以要么发严格之后的内容，
+   要么打开 `resume.dedupe`。
+
+### 断连不等于取消
+
+`pauseWhenHidden`、离线、页面刷新都会**中断请求**。如果服务端把「socket 断了」当作「用户
+要停止」，切回标签页就会看到一个只写了一半的回复。服务端需要把两者分开：连接断开只是
+**没有观测者**，生成应当继续跑完并写进日志；只有显式的取消请求才终止它。客户端的
+`setResumePoint` / `joinRun` 都建立在这个区分上。
+
+### 第二条只读通道（F5、新标签页、多标签页接管）
+
+`Last-Event-ID` 只能表达「从这儿之后继续」，表达不了「把这个 run 从头放给我」。而一个刚
+打开的页面恰恰什么都没看到。所以建议并排提供：
+
+- `POST`：建立订阅、携带 `Last-Event-ID` 增量续传；
+- `GET ?offset=-1&runId=…`：只读重放，**不触发任何生成**，可以安全地被新标签页调用。
+
+客户端侧的对应实现是 `createJoinClient()`，见下。
+
+### 快照语义
+
+`hooks.gap` 的标准反应是「重拉快照，然后 `setResumePoint(snapshot.id)`」。要让这件事可靠，
+快照接口需要满足：**返回调用时刻已经存下的内容，绝不等待新数据；没有数据时返回空，而不是
+报错或挂着**。否则补洞的动作本身会引入一次新的超时。
 
 ## 设计说明
 

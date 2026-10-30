@@ -32,6 +32,12 @@ export { jsonParse } from "./decode.js";
 export { deriveResumeKey, RESUME_KEY_PREFIX } from "./resume.js";
 export type { ResumeStorage } from "./resume.js";
 
+// Resume-point hygiene and the second, read-only channel a fresh tab needs.
+export { isValidEventId } from "./id.js";
+
+export { JOIN_START_OFFSET, createJoinClient, deriveJoinUrl } from "./join.js";
+export type { JoinClientOptions, JoinHandle, JoinOptions } from "./join.js";
+
 // Shared connections. The registry helpers behind them (`getSharedSSEClients`,
 // `getSharedSSEClientCount`, `closeAllSharedSSEClients`) live on the testing
 // entry: they exist for tests and teardown, not for application code.

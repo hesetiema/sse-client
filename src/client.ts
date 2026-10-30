@@ -6,6 +6,7 @@ import {
   type SSEClientOptions,
 } from "./options.js";
 import { createFanout, type SseFanout } from "./fanout.js";
+import { isValidEventId } from "./id.js";
 import {
   DEFAULT_MAX_BUFFER_SIZE,
   createSSEParser,
@@ -77,6 +78,14 @@ export class SSEClient<E extends object = SSEEventMap> {
   private suspended: "hidden" | "offline" | null = null;
   private attempt = 0;
   private lastEventIdValue = "";
+  /** Ids refused because they cannot survive a `Last-Event-ID` round trip. */
+  private invalidIdCount = 0;
+  /** Events suppressed as replays under `resume.dedupe`. */
+  private duplicateCount = 0;
+  /** Every id already dispatched; only filled when `resume.dedupe` is on. */
+  private readonly seenEventIds = new Set<string>();
+  /** Set once an unmatchable id has been reported, so a broken server reports once. */
+  private invalidIdReported = false;
   private serverRetryDelay: number | undefined;
   /** Where `lastEventId` is persisted, `null` when persistence is off. */
   private readonly persistKey: string | null;
@@ -143,8 +152,17 @@ export class SSEClient<E extends object = SSEEventMap> {
       ? resolveResumeStorage(resolved.persistStorage)
       : null;
     // An explicit `resumeFrom` wins over what the previous page load stored.
-    this.lastEventIdValue =
+    const seeded =
       resolved.resumeFrom ?? readResumePoint(this.persistStorage, this.persistKey ?? "");
+    // A resume point that cannot be echoed back (a stored value a proxy mangled,
+    // a snapshot id carrying a newline) would break every reconnect for this tab,
+    // so it is dropped instead of sent. The counter is the only trace: a broken
+    // seed is better silenced than surfaced as a gap on a stream that never ran.
+    if (seeded && isValidEventId(seeded)) {
+      this.lastEventIdValue = seeded;
+    } else if (seeded) {
+      this.invalidIdCount += 1;
+    }
     this.parser = createSSEParser({
       maxBufferSize: resolved.maxBufferSize ?? DEFAULT_MAX_BUFFER_SIZE,
       overflowPolicy: resolved.overflowPolicy ?? "close",
@@ -194,6 +212,16 @@ export class SSEClient<E extends object = SSEEventMap> {
   /** Messages discarded under `overflowPolicy: "drop"` so far. */
   get dropped(): number {
     return this.parser.dropped;
+  }
+
+  /** Ids refused because they cannot survive a `Last-Event-ID` round trip. */
+  get invalidIds(): number {
+    return this.invalidIdCount;
+  }
+
+  /** Events suppressed as replays under `resume.dedupe`. */
+  get duplicates(): number {
+    return this.duplicateCount;
   }
 
   /** Resolves when the connection terminates (closed or retries exhausted). Never rejects. */
@@ -270,6 +298,14 @@ export class SSEClient<E extends object = SSEEventMap> {
    * would desynchronise the parser instead of healing the gap.
    */
   setResumePoint(id: string): void {
+    if (!isValidEventId(id)) {
+      // Refusing beats storing: a point the server cannot match restarts the
+      // stream somewhere arbitrary, and nothing reports it. Keeping the previous
+      // point is the only outcome that can still be repaired by a snapshot.
+      this.invalidIdCount += 1;
+      this.reportInvalidId();
+      return;
+    }
     this.pendingResumePoint = id;
   }
 
@@ -432,6 +468,10 @@ export class SSEClient<E extends object = SSEEventMap> {
     this.clearTimers();
     this.cancelController = new AbortController();
     this.attemptController = null;
+    // A reopen is a new lifecycle: the replay set would otherwise suppress ids
+    // this client is now legitimately asking the server to send again.
+    this.seenEventIds.clear();
+    this.invalidIdReported = false;
     this.parser.reset();
   }
 
@@ -707,6 +747,27 @@ export class SSEClient<E extends object = SSEEventMap> {
     });
   }
 
+  /**
+   * Report an id the resume cursor cannot carry.
+   *
+   * Once per client, not once per episode: a server that mints unmatchable ids
+   * does it on every event of every connection, and one actionable report beats
+   * a line after each reconnect. `invalidIds` keeps the running total. The flag
+   * deliberately does not share `gapReported`, so a contract violation early in
+   * the stream cannot mask the `reconnect` gap that follows it.
+   */
+  private reportInvalidId(): void {
+    if (this.invalidIdReported) {
+      return;
+    }
+    this.invalidIdReported = true;
+    this.emit(this.gapHandlers, {
+      reason: "id",
+      lastId: this.lastEventIdValue,
+      attempt: this.attempt,
+    });
+  }
+
   /** Compare the first id of the new stream with the resume point that was sent. */
   private reportResume(firstId: string): void {
     const lastId = this.resumeCheckFrom;
@@ -765,17 +826,38 @@ export class SSEClient<E extends object = SSEEventMap> {
         return;
       }
     }
+    // An id the resume cursor cannot carry is refused before it can reach
+    // `Last-Event-ID` or storage. The message is still delivered under the
+    // previous id: the payload is not in question, only the position it claimed.
+    let eventId = event.id;
+    if (eventId && !isValidEventId(eventId)) {
+      this.invalidIdCount += 1;
+      this.reportInvalidId();
+      eventId = "";
+    }
     // Verified before the allow-list filter and before the id fallback: the check
     // is about what the server said, not about what this client cares about.
-    if (this.resumeCheckPending && event.id) {
+    if (this.resumeCheckPending && eventId) {
       this.resumeCheckPending = false;
-      this.reportResume(event.id);
+      this.reportResume(eventId);
     }
-    const id = event.id || this.lastEventIdValue;
-    if (id && id !== this.lastEventIdValue) {
-      this.lastEventIdValue = id;
-      this.schedulePersist();
+    if (eventId) {
+      if (this.options.dedupe) {
+        if (this.seenEventIds.has(eventId)) {
+          // The server resumed inclusively, or re-sent a wider overlap. For a
+          // token stream a second dispatch is a duplicated word in the output,
+          // so it is dropped here rather than reported.
+          this.duplicateCount += 1;
+          return;
+        }
+        this.seenEventIds.add(eventId);
+      }
+      if (eventId !== this.lastEventIdValue) {
+        this.lastEventIdValue = eventId;
+        this.schedulePersist();
+      }
     }
+    const id = eventId || this.lastEventIdValue;
     const name = event.event || "message";
     // Filter after updating the id so the resume position never moves backwards.
     if (this.eventFilter && !this.eventFilter.has(name)) {

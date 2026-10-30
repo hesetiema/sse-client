@@ -97,6 +97,9 @@ export function deriveShareKey(options: SSEClientOptions, keyOptions: KeyOptions
         method: resolved.method ?? "POST",
         body: body ?? null,
         events: resolved.events ?? null,
+        // Also changes what a consumer receives: a deduping consumer must not end
+        // up behind a connection that never suppresses anything.
+        dedupe: resolved.dedupe ?? false,
       },
       sortArrays,
     ),

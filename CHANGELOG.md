@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Resume-point hygiene, and the second channel a freshly opened page needs. The theme is
+the one thing a client can still get wrong after it has a cursor: a cursor the server
+cannot match.
+
+### Added
+
+- `isValidEventId(id)`: an id must be non-empty, free of `\r`/`\n`/`\0`, and free of
+  leading/trailing whitespace to survive the `Last-Event-ID` round trip. Exported so a
+  server and its tests use the same rule.
+- Inbound ids are validated **before** they are accepted. An unmatchable id no longer
+  advances the resume point: the message is still delivered under the previous id, the
+  event is counted in `invalidIds`, and `hooks.gap` reports it once with `reason: "id"`.
+  The report has its own slot, so a contract violation early in the stream cannot mask the
+  `reconnect` gap that follows it.
+- `resume.dedupe`: suppress events whose id was already delivered, across reconnects. Off by
+  default — the client reports inclusive replays through `hooks.resume` (`skipped === 0`)
+  instead of dropping them. Counted in `duplicates`.
+- `createJoinClient()` / `deriveJoinUrl()` / `JOIN_START_OFFSET`: a read-only `GET` replay of
+  a run from its first event, for a new tab or a reload. It sends no `Last-Event-ID`, does not
+  reconnect past the end, and resolves `done` with the tail id to hand to `setResumePoint`.
+- README: a server-contract section covering what `Last-Event-ID` needs to be trustworthy —
+  unique ids, persist-before-send, disconnect ≠ cancel, the read-only join route, and the
+  snapshot semantics `hooks.gap` assumes.
+
+### Changed
+
+- `setResumePoint(id)` refuses an id that cannot be echoed back (keeping the previous point
+  and counting it) instead of installing it and breaking the next connection.
+- A resume point restored from storage through the same check: a poisoned
+  `sessionStorage` entry is dropped rather than reused on every reconnect.
+
 ## [0.2.0] — 2026-10-27
 
 The release that makes the option list readable — six groups instead of 38 top-level
